@@ -1,0 +1,20 @@
+node_modules/
+dist/
+downloads/
+logs/
+*.log
+*.err
+*.jsonl
+results/
+docs/
+
+# session artifacts
+PROMPT-*.md
+PLAYBOOK-delta-*.md
+NEXT-*.md
+SPEC-*.md
+failed-tasks.txt
+bashes.log
+
+# misc
+.vite/

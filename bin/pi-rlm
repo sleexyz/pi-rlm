@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec bun "$DIR/pi-rlm/src/cli.ts" "$@"
+

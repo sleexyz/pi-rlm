@@ -1,0 +1,526 @@
+// ── State ───────────────────────────────────────────────────────────
+
+let sessions = [];
+let resultMap = {}; // taskId -> { correct, cost, tokens, model }
+let activeSessionId = null;
+let currentTurnCount = 0;
+let activeSessions = new Set();
+
+const sidebar = document.getElementById("sidebar");
+const trace = document.getElementById("trace");
+
+// ── Load data ───────────────────────────────────────────────────────
+
+async function init() {
+  const [sessData, resData] = await Promise.all([
+    fetch("/api/sessions").then((r) => r.json()),
+    fetch("/api/results").then((r) => r.json()),
+  ]);
+
+  sessions = sessData;
+
+  // Build result map from all result files
+  for (const rf of resData) {
+    const model = rf.config?.model || "";
+    for (const r of rf.results) {
+      resultMap[r.taskId] = { correct: r.correct, cost: r.cost, tokens: r.tokens, model };
+    }
+  }
+
+  // Populate activeSessions from session data
+  for (const s of sessions) {
+    if (s.active) activeSessions.add(s.sessionId);
+  }
+
+  renderSidebar();
+  connectWS();
+}
+
+// ── Sidebar ─────────────────────────────────────────────────────────
+
+function renderSidebar() {
+  if (sessions.length === 0) {
+    sidebar.innerHTML =
+      '<div class="no-sessions">No sessions found.<br>Run arc-runner with --log to create logs.</div>';
+    return;
+  }
+
+  sidebar.innerHTML = sessions
+    .map((s) => {
+      const label = s.taskId || s.sessionId;
+      const result = s.taskId ? resultMap[s.taskId] : null;
+      const isLive = activeSessions.has(s.sessionId);
+      const badge = isLive
+        ? '<span class="badge live">LIVE</span>'
+        : result
+          ? result.correct
+            ? '<span class="badge ok">CORRECT</span>'
+            : '<span class="badge err">WRONG</span>'
+          : "";
+      const cost = s.usage ? "$" + s.usage.totalCost.toFixed(4) : "";
+      const tokens = s.usage ? s.usage.totalTokens.toLocaleString() + " tok" : "";
+      const model = s.model || (result && result.model) || "";
+      const modelShort = model.replace("claude-", "").replace(/-\d+$/, "");
+      const date = s.ts ? friendlyDate(s.ts) : "";
+      const line1 = [s.turns + " turns", cost, tokens].filter(Boolean).join(" \u00b7 ");
+      const line2 = [modelShort, date].filter(Boolean).join(" \u00b7 ");
+
+      return (
+        '<div class="session-item" data-id="' +
+        esc(s.sessionId) +
+        '">' +
+        '<span class="task-id">' +
+        esc(label) +
+        "</span>" +
+        badge +
+        '<div class="meta">' +
+        esc(line1) +
+        "</div>" +
+        (line2 ? '<div class="meta">' + esc(line2) + "</div>" : "") +
+        "</div>"
+      );
+    })
+    .join("");
+
+  sidebar.querySelectorAll(".session-item").forEach((el) => {
+    el.addEventListener("click", () => loadTrace(el.dataset.id));
+  });
+
+  // Re-apply active highlight if a session is selected
+  if (activeSessionId) {
+    sidebar.querySelectorAll(".session-item").forEach((el) => {
+      el.classList.toggle("active", el.dataset.id === activeSessionId);
+    });
+  }
+}
+
+async function refreshSessions() {
+  const sessData = await fetch("/api/sessions").then((r) => r.json());
+  sessions = sessData;
+  renderSidebar();
+}
+
+// ── Trace loading ───────────────────────────────────────────────────
+
+async function loadTrace(sessionId) {
+  activeSessionId = sessionId;
+
+  sidebar.querySelectorAll(".session-item").forEach((el) => {
+    el.classList.toggle("active", el.dataset.id === sessionId);
+  });
+
+  const events = await fetch("/api/session/" + encodeURIComponent(sessionId)).then((r) =>
+    r.json(),
+  );
+  renderTrace(events);
+}
+
+// ── Trace rendering ─────────────────────────────────────────────────
+
+function renderSingleEvent(evt) {
+  const depth = evt.depth ?? 0;
+  const depthClass = "depth-" + Math.min(depth, 3);
+
+  switch (evt.type) {
+    case "session_start": {
+      const div = mk("div", "event verbose " + depthClass);
+      div.innerHTML = '<span class="dim">Session: ' + esc(evt.sessionId || "") + "</span>";
+      trace.appendChild(div);
+      break;
+    }
+
+    case "agent_start": {
+      const label = evt.label || "Agent";
+      const idTag = evt.agentId != null ? "#" + evt.agentId + " " : "";
+
+      const div = mk("div", "event verbose " + depthClass);
+      div.innerHTML =
+        '<div class="agent-header">\u250c\u2500 ' +
+        esc(idTag + label) +
+        " " +
+        "\u2500".repeat(Math.max(0, 50 - (idTag + label).length)) +
+        "</div>";
+
+      if (evt.systemPrompt) {
+        const details = document.createElement("details");
+        details.className = "sys-block";
+        details.innerHTML =
+          '<summary class="sys">SYS  System Prompt</summary>' +
+          '<div class="collapsible-content sys">' +
+          esc(evt.systemPrompt) +
+          "</div>";
+        div.appendChild(details);
+      }
+
+      if (evt.userMessage) {
+        const um = mk("pre", "usr");
+        um.textContent = "USR  " + evt.userMessage;
+        div.appendChild(um);
+      }
+
+      trace.appendChild(div);
+      break;
+    }
+
+    case "turn_start": {
+      currentTurnCount++;
+      if (currentTurnCount > 1) {
+        const hr = document.createElement("hr");
+        hr.className = "turn-sep verbose";
+        hr.dataset.turn = "Turn " + currentTurnCount;
+        trace.appendChild(hr);
+      }
+      break;
+    }
+
+    case "message_end": {
+      if (!evt.content) break;
+
+      for (const block of evt.content) {
+        if (block.type === "thinking" && block.thinking) {
+          const details = document.createElement("details");
+          details.className = "event thk-block " + depthClass;
+          const preview = block.thinking.split("\n")[0].slice(0, 80);
+          details.innerHTML =
+            '<summary class="thk">THK  ' +
+            esc(preview) +
+            "\u2026</summary>" +
+            '<div class="collapsible-content thk">' +
+            esc(block.thinking) +
+            "</div>";
+          trace.appendChild(details);
+        }
+
+        if (block.type === "text" && block.text) {
+          const div = mk("div", "event llm " + depthClass);
+          const pre = mk("pre", "llm");
+          pre.textContent = block.text;
+          div.appendChild(pre);
+          trace.appendChild(div);
+        }
+
+        if (block.type === "tool_use" && block.name) {
+          const div = mk("div", "event eval " + depthClass);
+          const code = block.arguments?.code || block.input?.code || "";
+          if (code) {
+            const details = document.createElement("details");
+            details.open = true;
+            details.innerHTML =
+              '<summary class="eval">TOOL ' +
+              esc(block.name) +
+              "</summary>" +
+              '<div class="collapsible-content eval">' +
+              esc(code) +
+              "</div>";
+            div.appendChild(details);
+          } else {
+            div.innerHTML = '<span class="eval">TOOL ' + esc(block.name) + "</span>";
+          }
+          trace.appendChild(div);
+        }
+      }
+      break;
+    }
+
+    case "tool_execution_start": {
+      const code = evt.code;
+      if (code) {
+        const details = document.createElement("details");
+        details.className = "event " + depthClass;
+        details.open = true;
+        details.innerHTML =
+          '<summary class="eval">EVAL ' +
+          esc(evt.toolName || "code") +
+          "</summary>" +
+          '<div class="collapsible-content eval">' +
+          esc(code) +
+          "</div>";
+        trace.appendChild(details);
+      } else if (evt.toolName) {
+        const div = mk("div", "event verbose " + depthClass);
+        div.innerHTML = '<span class="dim">' + esc(evt.toolName) + "\u2026</span>";
+        trace.appendChild(div);
+      }
+      break;
+    }
+
+    case "tool_execution_end": {
+      const resultText = formatResult(evt.result);
+      if (resultText) {
+        const details = document.createElement("details");
+        details.className = "event " + depthClass;
+        const preview = resultText.split("\n")[0].slice(0, 80);
+        const hasError = resultText.includes("ERROR:");
+        const hasOk = /^→|accuracy|correct|score/im.test(resultText);
+        const cls = hasError ? "err" : hasOk ? "ok" : "output";
+
+        details.innerHTML =
+          '<summary class="' +
+          cls +
+          '">OUT  ' +
+          esc(preview) +
+          "</summary>" +
+          '<div class="collapsible-content">' +
+          colorizeOutput(resultText) +
+          "</div>";
+        trace.appendChild(details);
+      }
+      break;
+    }
+
+    case "agent_end": {
+      const div = mk("div", "event verbose " + depthClass);
+      div.innerHTML =
+        '<div class="agent-footer">\u2514' + "\u2500".repeat(55) + "</div>";
+      trace.appendChild(div);
+      break;
+    }
+
+    case "session_end": {
+      const u = evt.usage;
+      if (u) {
+        const div = mk("div", "usage-summary");
+        const tokens = (u.totalTokens || 0).toLocaleString();
+        const cost = "$" + (u.totalCost || 0).toFixed(4);
+        div.innerHTML =
+          "\u2500\u2500 Usage \u2500\u2500<br>Tokens: " +
+          tokens +
+          " \u00b7 Cost: " +
+          cost +
+          " \u00b7 Turns: " +
+          currentTurnCount;
+        trace.appendChild(div);
+      }
+      break;
+    }
+  }
+}
+
+function renderTrace(events) {
+  trace.className = "";
+  trace.innerHTML = "";
+  currentTurnCount = 0;
+
+  const turnFilter = parseInt(document.getElementById("f-turn").value, 10);
+  let turnNum = 0;
+  let inFilteredTurn = true;
+
+  for (const evt of events) {
+    if (evt.type === "turn_start") {
+      turnNum++;
+      inFilteredTurn = turnFilter < 0 || turnNum === turnFilter;
+      if (!inFilteredTurn) continue;
+    }
+    if (!inFilteredTurn && (evt.type === "message_end" || evt.type === "tool_execution_start" || evt.type === "tool_execution_end")) continue;
+
+    renderSingleEvent(evt);
+  }
+
+  if (trace.children.length === 0) {
+    trace.className = "empty";
+    trace.textContent = "No events to display";
+  }
+
+  trace.scrollTop = 0;
+  applyFilters();
+}
+
+// ── Live event streaming ────────────────────────────────────────────
+
+function appendLiveEvent(evt) {
+  // Remove "empty" state if this is the first live event
+  if (trace.className === "empty") {
+    trace.className = "";
+    trace.innerHTML = "";
+  }
+
+  // Auto-scroll if user is near the bottom (within 150px)
+  const nearBottom = trace.scrollHeight - trace.scrollTop - trace.clientHeight < 150;
+
+  renderSingleEvent(evt);
+  applyFilters();
+
+  if (nearBottom) {
+    trace.scrollTop = trace.scrollHeight;
+  }
+}
+
+// ── WebSocket client ────────────────────────────────────────────────
+
+let ws = null;
+
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(proto + "//" + location.host + "/ws");
+
+  ws.onmessage = (e) => {
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+
+    switch (msg.type) {
+      case "active_sessions": {
+        for (const id of msg.sessionIds) {
+          activeSessions.add(id);
+        }
+        renderSidebar();
+        break;
+      }
+
+      case "session_active": {
+        activeSessions.add(msg.sessionId);
+        refreshSessions();
+        break;
+      }
+
+      case "event": {
+        if (msg.sessionId === activeSessionId) {
+          appendLiveEvent(msg.event);
+        }
+        break;
+      }
+
+      case "session_ended": {
+        activeSessions.delete(msg.sessionId);
+        renderSidebar();
+        // Reload full trace for clean final render
+        if (msg.sessionId === activeSessionId) {
+          loadTrace(activeSessionId);
+        }
+        break;
+      }
+    }
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    setTimeout(connectWS, 2000);
+  };
+
+  ws.onerror = () => {
+    ws?.close();
+  };
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+function mk(tag, cls) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  return e;
+}
+
+function esc(s) {
+  if (!s) return "";
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function friendlyDate(ts) {
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const diff = now - d;
+  const mins = Math.floor(diff / 60000);
+  const hrs = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins + "m ago";
+  if (hrs < 24) return hrs + "h ago";
+  if (days < 7) return days + "d ago";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function formatResult(result) {
+  if (!result) return "";
+  const content = result.content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((c) => c.type === "text" && c.text)
+    .map((c) => c.text.trim())
+    .join("\n")
+    .trim();
+}
+
+function colorizeOutput(text) {
+  return text
+    .split("\n")
+    .map((line) => {
+      if (line.startsWith("ERROR:")) return '<span class="err">' + esc(line) + "</span>";
+      if (/^→|accuracy|correct|score/i.test(line))
+        return '<span class="ok">' + esc(line) + "</span>";
+      return '<span class="output">' + esc(line) + "</span>";
+    })
+    .join("\n");
+}
+
+// ── Filters ─────────────────────────────────────────────────────────
+
+function applyFilters() {
+  document.body.classList.toggle("hide-thinking", document.getElementById("f-thinking").checked);
+  document.body.classList.toggle("hide-sysprompt", document.getElementById("f-sysprompt").checked);
+  document.body.classList.toggle("compact", document.getElementById("f-compact").checked);
+}
+
+document.getElementById("f-thinking").addEventListener("change", applyFilters);
+document.getElementById("f-sysprompt").addEventListener("change", applyFilters);
+document.getElementById("f-compact").addEventListener("change", applyFilters);
+document.getElementById("f-turn").addEventListener("change", () => {
+  if (activeSessionId) loadTrace(activeSessionId);
+});
+
+// ── Keyboard shortcuts ──────────────────────────────────────────────
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+
+  switch (e.key) {
+    case "j": {
+      const seps = trace.querySelectorAll(".turn-sep");
+      const scrollTop = trace.scrollTop;
+      for (const sep of seps) {
+        if (sep.offsetTop > scrollTop + 10) {
+          trace.scrollTo({ top: sep.offsetTop - 8, behavior: "smooth" });
+          break;
+        }
+      }
+      break;
+    }
+    case "k": {
+      const seps = [...trace.querySelectorAll(".turn-sep")].reverse();
+      const scrollTop = trace.scrollTop;
+      for (const sep of seps) {
+        if (sep.offsetTop < scrollTop - 10) {
+          trace.scrollTo({ top: sep.offsetTop - 8, behavior: "smooth" });
+          break;
+        }
+      }
+      break;
+    }
+    case "e": {
+      trace.querySelectorAll("details").forEach((d) => (d.open = true));
+      break;
+    }
+    case "c": {
+      trace.querySelectorAll("details").forEach((d) => (d.open = false));
+      break;
+    }
+    case "t": {
+      const cb = document.getElementById("f-thinking");
+      cb.checked = !cb.checked;
+      applyFilters();
+      break;
+    }
+    case "s": {
+      const cb = document.getElementById("f-sysprompt");
+      cb.checked = !cb.checked;
+      applyFilters();
+      break;
+    }
+  }
+});
+
+// ── Init ────────────────────────────────────────────────────────────
+
+init();
