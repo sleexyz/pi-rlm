@@ -7,32 +7,32 @@
  *
  * Options:
  *   --data-dir <path>      Path to ARC-AGI-2 data dir (default: ../downloads/ARC-AGI-2/data)
- *   --log-dir <path>       Log directory relative to repo root (default: logs/arc-2)
- *   --results-dir <path>   Results directory relative to repo root (default: results/arc-2)
+ *   --runs-dir <path>      Runs directory relative to repo root (default: runs)
+ *   --name <name>          Run name (default: auto-generated)
  *   --split <name>         training or evaluation (default: training)
  *   --count <n>            Number of tasks to run (default: 5)
  *   --task-id <id>         Run a specific task by ID
  *   --model <model>        Model name (default: claude-opus-4-6)
- *   --thinking <level>     Thinking level: off, low, medium, high, xhigh (default: xhigh)
+ *   --thinking <level>     Thinking level: off, low, medium, high, xhigh (default: high)
  *   --num-attempts <n>     Attempts per task for pass@K scoring (default: 2)
  *   --max-agents <n>       Max total agents per attempt (default: 10)
  *   --task-ids-file <path> Run specific tasks listed in a file (one ID per line)
- *   --label <name>         Label suffix for result files (e.g. "retry")
  *   --shard <n>            Shard index for parallel runs (0-based)
  *   --num-shards <n>       Total number of shards
- *   --resume <session-id>  Resume an aborted session
+ *   --resume <run-name>    Resume an interrupted run (skips completed tasks)
  *   --stream               Stream agent output to stdout
- *   --no-log               Disable session logging
+ *   --no-log               Disable session logging (still writes run.json)
  */
 
 import { getModel, streamSimple } from "@mariozechner/pi-ai";
 import type { AssistantMessageEvent } from "@mariozechner/pi-ai";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { Orchestrator, OrchestratorTUI, createOAuthResolver, SessionDir, AgentLogger } from "pi-rlm";
+import { Orchestrator, OrchestratorTUI, createOAuthResolver, SessionDir } from "pi-rlm";
 import type { TaggedAgentEvent } from "pi-rlm";
 import { createArcAdapter } from "./adapter.js";
 import { loadTask, loadTasksFromDir, selectDevSet } from "./task-loader.js";
 import { accuracy } from "./grid-helpers.js";
+import { generateRunName } from "./run-names.js";
 import type { ArcGrid, ArcAttempt, ArcResult } from "./types.js";
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -118,8 +118,8 @@ function getArg(name: string, fallback: string): string {
 
 const repoRoot = join(import.meta.dirname, "../../..");
 const dataDir = getArg("--data-dir", join(import.meta.dirname, "../../../downloads/ARC-AGI-2/data"));
-const logDir = getArg("--log-dir", "logs/arc-2");
-const resultsDir = getArg("--results-dir", "results/arc-2");
+const runsDir = getArg("--runs-dir", "runs");
+const runName = getArg("--name", "");
 const split = getArg("--split", "training");
 const count = parseInt(getArg("--count", "5"), 10);
 const taskId = getArg("--task-id", "");
@@ -130,15 +130,62 @@ const maxAgents = parseInt(getArg("--max-agents", "10"), 10);
 const shard = parseInt(getArg("--shard", "-1"), 10);
 const numShards = parseInt(getArg("--num-shards", "1"), 10);
 const taskIdsFile = getArg("--task-ids-file", "");
-const label = getArg("--label", "");
-const resumeSessionId = getArg("--resume", "");
+const resumeRunName = getArg("--resume", "");
 const allTasks = args.includes("--all");
 const stream = args.includes("--stream");
 const logEnabled = !args.includes("--no-log");
 
-// Resolve log/results dirs relative to repo root
-const resolvedLogDir = join(repoRoot, logDir);
-const resolvedResultsDir = join(repoRoot, resultsDir);
+// Resolve runs dir relative to repo root
+const resolvedRunsDir = join(repoRoot, runsDir);
+
+// ── run.json helpers ──
+
+interface RunJson {
+	name: string;
+	startedAt: string;
+	config: {
+		split: string;
+		model: string;
+		thinking: string;
+		numAttempts: number;
+		maxAgents: number;
+		taskIds: string[];
+		shard?: number;
+		numShards?: number;
+	};
+	results: ArcResult[];
+	summary?: {
+		correct: number;
+		total: number;
+		pct: number;
+		cost: number;
+		tokens: number;
+		timeMs: number;
+	};
+}
+
+function writeRunJson(path: string, data: RunJson): void {
+	writeFileSync(path, JSON.stringify(data, null, 2));
+}
+
+function loadRunJson(path: string): RunJson {
+	return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+// ── Resume mode ──
+
+let resumedRun: RunJson | undefined;
+let completedTaskIds: Set<string> | undefined;
+
+if (resumeRunName) {
+	const runJsonPath = join(resolvedRunsDir, resumeRunName, "run.json");
+	if (!existsSync(runJsonPath)) {
+		console.error(`Run not found: ${runJsonPath}`);
+		process.exit(1);
+	}
+	resumedRun = loadRunJson(runJsonPath);
+	completedTaskIds = new Set(resumedRun.results.map(r => r.taskId));
+}
 
 // ── Load tasks ──
 
@@ -149,32 +196,12 @@ interface TaskEntry {
 	task: ReturnType<typeof loadTask>;
 }
 
-// ── Resume mode: resolve agent log path and extract task info ──
-
-let resumeAgentLogPath: string | undefined;
-let resumeMetadata: Record<string, unknown> | undefined;
-
-if (resumeSessionId) {
-	resumeAgentLogPath = join(resolvedLogDir, resumeSessionId, "agent-0.jsonl");
-	if (!existsSync(resumeAgentLogPath)) {
-		console.error(`Resume log not found: ${resumeAgentLogPath}`);
-		process.exit(1);
-	}
-	resumeMetadata = AgentLogger.loadSessionMetadata(resumeAgentLogPath);
-}
-
 let tasks: TaskEntry[];
-if (resumeSessionId && resumeMetadata) {
-	// In resume mode, extract taskId from session metadata
-	const resumeTaskId = (taskId || resumeMetadata.taskId) as string;
-	if (!resumeTaskId) {
-		console.error("Cannot determine task ID for resume. Provide --task-id or ensure session metadata contains taskId.");
-		process.exit(1);
-	}
-	const resumeSplit = (resumeMetadata.split as string) || split;
-	const resumeSplitDir = join(dataDir, resumeSplit);
-	const task = loadTask(join(resumeSplitDir, `${resumeTaskId}.json`));
-	tasks = [{ id: resumeTaskId, task }];
+if (resumedRun) {
+	// In resume mode, reload the same task set from the original run config
+	const cfg = resumedRun.config;
+	const resumeSplitDir = join(dataDir, cfg.split);
+	tasks = cfg.taskIds.map(id => ({ id, task: loadTask(join(resumeSplitDir, `${id}.json`)) }));
 } else if (taskIdsFile) {
 	const ids = readFileSync(taskIdsFile, "utf-8").split("\n").map(s => s.trim()).filter(Boolean);
 	tasks = ids.map(id => ({ id, task: loadTask(join(splitDir, `${id}.json`)) }));
@@ -192,9 +219,39 @@ if (shard >= 0 && numShards > 1) {
 	tasks = tasks.filter((_, i) => i % numShards === shard);
 }
 
-console.log(`ARC-AGI-2 Evaluation`);
-console.log(`  Split: ${split}`);
-console.log(`  Tasks: ${tasks.length}${shard >= 0 ? ` (shard ${shard}/${numShards})` : ""}`);
+// ── Set up run directory ──
+
+const effectiveRunName = resumeRunName || runName || generateRunName();
+const runDir = join(resolvedRunsDir, effectiveRunName);
+const sessionsDir = join(runDir, "sessions");
+const runJsonPath = join(runDir, "run.json");
+
+mkdirSync(sessionsDir, { recursive: true });
+
+// Initialize run.json (or preserve resumed run's data)
+const runJson: RunJson = resumedRun
+	? { ...resumedRun, name: effectiveRunName }
+	: {
+			name: effectiveRunName,
+			startedAt: new Date().toISOString(),
+			config: {
+				split,
+				model: modelName,
+				thinking: thinkingLevel,
+				numAttempts,
+				maxAgents,
+				taskIds: tasks.map(t => t.id),
+				...(shard >= 0 ? { shard, numShards } : {}),
+			},
+			results: [],
+		};
+
+writeRunJson(runJsonPath, runJson);
+
+console.log(`ARC-AGI-2 Evaluation — ${effectiveRunName}`);
+console.log(`  Run dir: ${runDir}`);
+console.log(`  Split: ${resumedRun ? resumedRun.config.split : split}`);
+console.log(`  Tasks: ${tasks.length}${shard >= 0 ? ` (shard ${shard}/${numShards})` : ""}${completedTaskIds ? ` (${completedTaskIds.size} completed, ${tasks.length - completedTaskIds.size} remaining)` : ""}`);
 console.log(`  Model: ${modelName}`);
 console.log(`  Thinking: ${thinkingLevel}`);
 console.log(`  Attempts: ${numAttempts} (pass@${numAttempts})`);
@@ -213,10 +270,15 @@ const maxTokensStreamFn: typeof streamSimple = (model, context, options) => {
 	return streamSimple(model, context, { ...options, maxTokens: 128000 });
 };
 
-const results: ArcResult[] = [];
-
 for (let i = 0; i < tasks.length; i++) {
 	const { id, task } = tasks[i];
+
+	// Skip already-completed tasks in resume mode
+	if (completedTaskIds?.has(id)) {
+		console.log(`[${i + 1}/${tasks.length}] Task ${id}... SKIPPED (already completed)`);
+		continue;
+	}
+
 	console.log(`[${i + 1}/${tasks.length}] Task ${id}...`);
 
 	const expected = task.test[0].output;
@@ -227,7 +289,7 @@ for (let i = 0; i < tasks.length; i++) {
 
 		const adapter = createArcAdapter(task);
 
-		const sessionDir = logEnabled ? new SessionDir({ logDir: resolvedLogDir, metadata: { taskId: id, split, model: modelName, attempt: a } }) : undefined;
+		const sessionDir = logEnabled ? new SessionDir({ logDir: sessionsDir, sessionId: `${id}_a${a}`, metadata: { taskId: id, split, model: modelName, attempt: a, run: effectiveRunName } }) : undefined;
 
 		let tui: OrchestratorTUI | null = null;
 
@@ -255,14 +317,9 @@ for (let i = 0; i < tasks.length; i++) {
 		let resolvedValue: unknown;
 		let runError: string | undefined;
 		try {
-			if (resumeAgentLogPath && a === 0) {
-				// Resume mode: restore conversation from prior session log
-				resolvedValue = await orchestrator.resume(resumeAgentLogPath);
-			} else {
-				resolvedValue = await orchestrator.run(
-					"Analyze the training examples, discover the transformation rule, write a `transform(grid)` function, test it on ALL training examples until accuracy=1.0, then resolve with the transform function.",
-				);
-			}
+			resolvedValue = await orchestrator.run(
+				"Analyze the training examples, discover the transformation rule, write a `transform(grid)` function, test it on ALL training examples until accuracy=1.0, then resolve with the transform function.",
+			);
 		} catch (err) {
 			runError = String(err);
 			console.error(`    Error: ${err}`);
@@ -323,7 +380,10 @@ for (let i = 0; i < tasks.length; i++) {
 		tokens: taskTokens,
 		timeMs: taskTime,
 	};
-	results.push(result);
+	runJson.results.push(result);
+
+	// Write run.json incrementally after each task
+	writeRunJson(runJsonPath, runJson);
 
 	const taskStatus = taskCorrect ? "CORRECT" : taskFailed ? "FAILED" : "WRONG";
 	console.log(`  pass@${numAttempts}: ${taskStatus} | cost=$${taskCost.toFixed(4)} | tokens=${taskTokens.toLocaleString()} | time=${(taskTime / 1000).toFixed(1)}s`);
@@ -332,46 +392,34 @@ for (let i = 0; i < tasks.length; i++) {
 
 // ── Summary ──
 
-const correctCount = results.filter((r) => r.correct).length;
-const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
-const totalTokens = results.reduce((sum, r) => sum + r.tokens, 0);
-const totalTime = results.reduce((sum, r) => sum + r.timeMs, 0);
+const correctCount = runJson.results.filter((r) => r.correct).length;
+const totalCost = runJson.results.reduce((sum, r) => sum + r.cost, 0);
+const totalTokens = runJson.results.reduce((sum, r) => sum + r.tokens, 0);
+const totalTime = runJson.results.reduce((sum, r) => sum + r.timeMs, 0);
+
+runJson.summary = {
+	correct: correctCount,
+	total: runJson.results.length,
+	pct: runJson.results.length > 0 ? correctCount / runJson.results.length : 0,
+	cost: totalCost,
+	tokens: totalTokens,
+	timeMs: totalTime,
+};
+
+writeRunJson(runJsonPath, runJson);
 
 console.log("=".repeat(60));
-console.log(`Results Summary (pass@${numAttempts})`);
+console.log(`Results Summary (pass@${numAttempts}) — ${effectiveRunName}`);
 console.log("=".repeat(60));
 console.log();
 
-for (const r of results) {
+for (const r of runJson.results) {
 	console.log(`  ${r.taskId}: ${r.correct ? "CORRECT" : r.failed ? "FAILED " : "WRONG  "} | $${r.cost.toFixed(4)} | ${(r.timeMs / 1000).toFixed(1)}s`);
 }
 
 console.log();
-console.log(`Score: ${correctCount}/${results.length} correct (${((correctCount / results.length) * 100).toFixed(1)}%) [pass@${numAttempts}]`);
+console.log(`Score: ${correctCount}/${runJson.results.length} correct (${(runJson.summary.pct * 100).toFixed(1)}%) [pass@${numAttempts}]`);
 console.log(`Total cost: $${totalCost.toFixed(4)}`);
 console.log(`Total tokens: ${totalTokens.toLocaleString()}`);
 console.log(`Total time: ${(totalTime / 1000).toFixed(1)}s`);
-
-// ── Save results ──
-
-mkdirSync(resolvedResultsDir, { recursive: true });
-
-const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-const labelSuffix = label ? `-${label}` : "";
-const shardSuffix = shard >= 0 ? `-shard${shard}` : "";
-const resultsPath = join(resolvedResultsDir, `${timestamp}${labelSuffix}${shardSuffix}.json`);
-
-writeFileSync(
-	resultsPath,
-	JSON.stringify(
-		{
-			config: { split, model: modelName, thinking: thinkingLevel, numAttempts, maxAgents, count: tasks.length, ...(shard >= 0 ? { shard, numShards } : {}) },
-			score: { correct: correctCount, total: results.length, pct: correctCount / results.length },
-			totals: { cost: totalCost, tokens: totalTokens, timeMs: totalTime },
-			results,
-		},
-		null,
-		2,
-	),
-);
-console.log(`\nResults saved: ${resultsPath}`);
+console.log(`\nRun saved: ${runJsonPath}`);
