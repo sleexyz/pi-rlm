@@ -11,16 +11,18 @@
   <header>
     <h1>ARC Trace Viewer</h1>
     <div class="filters">
+      <button id="btn-dashboard" class="header-btn">Dashboard</button>
       <label><input type="checkbox" id="f-thinking"> Hide thinking</label>
       <label><input type="checkbox" id="f-sysprompt"> Hide sysprompt</label>
       <label><input type="checkbox" id="f-compact"> Compact</label>
       <label>Turn <input type="number" id="f-turn" min="-1" value="-1" title="-1 = all"></label>
       <span id="last-event" class="kbd-hint"></span>
-      <span class="kbd-hint">j/k nav &middot; e/c expand/collapse &middot; t thinking &middot; s sysprompt</span>
+      <span class="kbd-hint">j/k nav &middot; e/c expand/collapse &middot; t thinking &middot; s sysprompt &middot; d dashboard</span>
     </div>
   </header>
   <div id="sidebar"></div>
   <div id="trace" class="empty">Select a session from the sidebar</div>
+  <div id="dashboard" class="hidden"></div>
 </div>
 <script type="module" src="./main.js"></script>
 </body>

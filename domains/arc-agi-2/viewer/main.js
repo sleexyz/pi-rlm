@@ -9,8 +9,15 @@ let streamingEl = null; // live-updating element for message_update deltas
 let streamingText = "";
 let streamingThinking = "";
 
+// Dashboard state
+let dashboardMode = false;
+/** @type {Map<string, { streamingEl: Element|null, streamingText: string, streamingThinking: string, turnCount: number }>} */
+const panelStates = new Map();
+
 const sidebar = document.getElementById("sidebar");
 const trace = document.getElementById("trace");
+const dashboard = document.getElementById("dashboard");
+const btnDashboard = document.getElementById("btn-dashboard");
 
 // ── Load data ───────────────────────────────────────────────────────
 
@@ -83,7 +90,7 @@ function renderSidebar() {
       const cost = s.usage ? "$" + s.usage.totalCost.toFixed(4) : "";
       const tokens = s.usage ? s.usage.totalTokens.toLocaleString() + " tok" : "";
       const model = s.model || (result && result.model) || "";
-      const modelShort = model.replace("claude-", "").replace(/-\d+$/, "");
+      const modelShort = model.replace("claude-", "").replace(/-\d{8,}$/, "");
       const date = s.ts ? friendlyDate(s.ts) : "";
       const line1 = [s.turns + " turns", cost, tokens].filter(Boolean).join(" \u00b7 ");
       const line2 = [modelShort, date].filter(Boolean).join(" \u00b7 ");
@@ -107,7 +114,10 @@ function renderSidebar() {
   sidebar.innerHTML = html;
 
   sidebar.querySelectorAll(".session-item").forEach((el) => {
-    el.addEventListener("click", () => loadTrace(el.dataset.id));
+    el.addEventListener("click", () => {
+      if (dashboardMode) exitDashboard();
+      loadTrace(el.dataset.id);
+    });
   });
 
   // Re-apply active highlight if a session is selected
@@ -127,29 +137,53 @@ async function refreshSessions() {
 // ── Trace loading ───────────────────────────────────────────────────
 
 async function loadTrace(sessionId) {
+  if (dashboardMode) exitDashboard();
+
+  // Unsubscribe old, subscribe new
+  if (ws && activeSessionId && activeSessionId !== sessionId) {
+    wsSend({ type: "unsubscribe", sessionId: activeSessionId });
+  }
+
   activeSessionId = sessionId;
 
   sidebar.querySelectorAll(".session-item").forEach((el) => {
     el.classList.toggle("active", el.dataset.id === sessionId);
   });
 
-  const events = await fetch("/api/session/" + encodeURIComponent(sessionId)).then((r) =>
-    r.json(),
-  );
-  renderTrace(events);
+  // If session is active, use subscription-based streaming
+  if (activeSessions.has(sessionId) && ws) {
+    // Clear trace and let replay fill it
+    trace.className = "";
+    trace.innerHTML = "";
+    currentTurnCount = 0;
+    streamingEl = null;
+    streamingText = "";
+    streamingThinking = "";
+    wsSend({ type: "subscribe", sessionId });
+  } else {
+    // Completed session — load via HTTP
+    const events = await fetch("/api/session/" + encodeURIComponent(sessionId)).then((r) =>
+      r.json(),
+    );
+    renderTrace(events);
+  }
 }
 
 // ── Trace rendering ─────────────────────────────────────────────────
 
-function renderSingleEvent(evt) {
+function renderSingleEvent(evt, container) {
+  if (!container) container = trace;
   const depth = evt.depth ?? 0;
   const depthClass = "depth-" + Math.min(depth, 3);
+
+  // Get the streaming state for this container
+  const state = getContainerState(container);
 
   switch (evt.type) {
     case "session_start": {
       const div = mk("div", "event verbose " + depthClass);
       div.innerHTML = '<span class="dim">Session: ' + esc(evt.sessionId || "") + "</span>";
-      trace.appendChild(div);
+      container.appendChild(div);
       break;
     }
 
@@ -184,17 +218,17 @@ function renderSingleEvent(evt) {
         div.appendChild(um);
       }
 
-      trace.appendChild(div);
+      container.appendChild(div);
       break;
     }
 
     case "turn_start": {
-      currentTurnCount++;
-      if (currentTurnCount > 1) {
+      state.turnCount++;
+      if (state.turnCount > 1) {
         const hr = document.createElement("hr");
         hr.className = "turn-sep verbose";
-        hr.dataset.turn = "Turn " + currentTurnCount + (evt.ts ? "  " + timeStr(evt.ts) : "");
-        trace.appendChild(hr);
+        hr.dataset.turn = "Turn " + state.turnCount + (evt.ts ? "  " + timeStr(evt.ts) : "");
+        container.appendChild(hr);
       }
       break;
     }
@@ -202,52 +236,49 @@ function renderSingleEvent(evt) {
     case "message_update": {
       if (!evt.delta) break;
       if (evt.deltaType === "thinking_delta") {
-        streamingThinking += evt.delta;
-        if (!streamingEl) {
-          streamingEl = mk("div", "event " + depthClass);
+        state.streamingThinking += evt.delta;
+        if (!state.streamingEl) {
+          state.streamingEl = mk("div", "event " + depthClass);
           const pre = mk("pre", "thk streaming-text");
-          streamingEl.appendChild(pre);
-          trace.appendChild(streamingEl);
+          state.streamingEl.appendChild(pre);
+          container.appendChild(state.streamingEl);
         }
-        const pre = streamingEl.querySelector(".streaming-text");
-        if (pre) pre.textContent = streamingThinking;
+        const pre = state.streamingEl.querySelector(".streaming-text");
+        if (pre) pre.textContent = state.streamingThinking;
       } else if (evt.deltaType === "text_delta") {
-        streamingText += evt.delta;
-        // If we were showing thinking, finalize it and start a new element
-        if (streamingThinking && streamingEl) {
-          // Collapse thinking into a details block
-          const thinkPre = streamingEl.querySelector(".streaming-text");
+        state.streamingText += evt.delta;
+        if (state.streamingThinking && state.streamingEl) {
+          const thinkPre = state.streamingEl.querySelector(".streaming-text");
           if (thinkPre) {
             const details = document.createElement("details");
             details.className = "event thk-block " + depthClass;
-            const preview = streamingThinking.split("\n")[0].slice(0, 80);
+            const preview = state.streamingThinking.split("\n")[0].slice(0, 80);
             details.innerHTML =
               '<summary class="thk">THK  ' + esc(preview) + '\u2026</summary>' +
-              '<div class="collapsible-content thk">' + esc(streamingThinking) + '</div>';
-            streamingEl.replaceWith(details);
+              '<div class="collapsible-content thk">' + esc(state.streamingThinking) + '</div>';
+            state.streamingEl.replaceWith(details);
           }
-          streamingThinking = "";
-          streamingEl = null;
+          state.streamingThinking = "";
+          state.streamingEl = null;
         }
-        if (!streamingEl) {
-          streamingEl = mk("div", "event llm " + depthClass);
+        if (!state.streamingEl) {
+          state.streamingEl = mk("div", "event llm " + depthClass);
           const pre = mk("pre", "llm streaming-text");
-          streamingEl.appendChild(pre);
-          trace.appendChild(streamingEl);
+          state.streamingEl.appendChild(pre);
+          container.appendChild(state.streamingEl);
         }
-        const pre = streamingEl.querySelector(".streaming-text");
-        if (pre) pre.textContent = streamingText;
+        const pre = state.streamingEl.querySelector(".streaming-text");
+        if (pre) pre.textContent = state.streamingText;
       }
       break;
     }
 
     case "message_end": {
-      // Clear streaming state — message_end has the final content
-      streamingText = "";
-      streamingThinking = "";
-      if (streamingEl) {
-        streamingEl.remove();
-        streamingEl = null;
+      state.streamingText = "";
+      state.streamingThinking = "";
+      if (state.streamingEl) {
+        state.streamingEl.remove();
+        state.streamingEl = null;
       }
       if (!evt.content) break;
 
@@ -263,7 +294,7 @@ function renderSingleEvent(evt) {
             '<div class="collapsible-content thk">' +
             esc(block.thinking) +
             "</div>";
-          trace.appendChild(details);
+          container.appendChild(details);
         }
 
         if (block.type === "text" && block.text) {
@@ -271,7 +302,7 @@ function renderSingleEvent(evt) {
           const pre = mk("pre", "llm");
           pre.textContent = block.text;
           div.appendChild(pre);
-          trace.appendChild(div);
+          container.appendChild(div);
         }
 
         if (block.type === "tool_use" && block.name) {
@@ -291,7 +322,7 @@ function renderSingleEvent(evt) {
           } else {
             div.innerHTML = '<span class="eval">TOOL ' + esc(block.name) + "</span>";
           }
-          trace.appendChild(div);
+          container.appendChild(div);
         }
       }
       break;
@@ -310,11 +341,11 @@ function renderSingleEvent(evt) {
           '<div class="collapsible-content eval">' +
           esc(code) +
           "</div>";
-        trace.appendChild(details);
+        container.appendChild(details);
       } else if (evt.toolName) {
         const div = mk("div", "event verbose " + depthClass);
         div.innerHTML = '<span class="dim">' + esc(evt.toolName) + "\u2026</span>";
-        trace.appendChild(div);
+        container.appendChild(div);
       }
       break;
     }
@@ -338,7 +369,7 @@ function renderSingleEvent(evt) {
           '<div class="collapsible-content">' +
           colorizeOutput(resultText) +
           "</div>";
-        trace.appendChild(details);
+        container.appendChild(details);
       }
       break;
     }
@@ -347,7 +378,7 @@ function renderSingleEvent(evt) {
       const div = mk("div", "event verbose " + depthClass);
       div.innerHTML =
         '<div class="agent-footer">\u2514' + "\u2500".repeat(55) + "</div>";
-      trace.appendChild(div);
+      container.appendChild(div);
       break;
     }
 
@@ -363,12 +394,35 @@ function renderSingleEvent(evt) {
           " \u00b7 Cost: " +
           cost +
           " \u00b7 Turns: " +
-          currentTurnCount;
-        trace.appendChild(div);
+          state.turnCount;
+        container.appendChild(div);
       }
       break;
     }
   }
+}
+
+/** Get or create per-container streaming state. For trace view, uses globals. */
+function getContainerState(container) {
+  if (container === trace) {
+    return {
+      get turnCount() { return currentTurnCount; },
+      set turnCount(v) { currentTurnCount = v; },
+      get streamingEl() { return streamingEl; },
+      set streamingEl(v) { streamingEl = v; },
+      get streamingText() { return streamingText; },
+      set streamingText(v) { streamingText = v; },
+      get streamingThinking() { return streamingThinking; },
+      set streamingThinking(v) { streamingThinking = v; },
+    };
+  }
+  // Dashboard panel — use panelStates keyed by panel's sessionId
+  const sid = container.dataset?.sessionId;
+  if (sid && panelStates.has(sid)) {
+    return panelStates.get(sid);
+  }
+  // Fallback: create ephemeral state
+  return { turnCount: 0, streamingEl: null, streamingText: "", streamingThinking: "" };
 }
 
 function renderTrace(events) {
@@ -391,7 +445,7 @@ function renderTrace(events) {
     }
     if (!inFilteredTurn && (evt.type === "message_end" || evt.type === "tool_execution_start" || evt.type === "tool_execution_end")) continue;
 
-    renderSingleEvent(evt);
+    renderSingleEvent(evt, trace);
   }
 
   if (trace.children.length === 0) {
@@ -405,31 +459,136 @@ function renderTrace(events) {
 
 // ── Live event streaming ────────────────────────────────────────────
 
-function appendLiveEvent(evt) {
+function appendLiveEvent(evt, container) {
+  if (!container) container = trace;
+
   // Remove "empty" state if this is the first live event
-  if (trace.className === "empty") {
+  if (container === trace && trace.className === "empty") {
     trace.className = "";
     trace.innerHTML = "";
   }
 
   // Auto-scroll if user is near the bottom (within 150px)
-  const nearBottom = trace.scrollHeight - trace.scrollTop - trace.clientHeight < 150;
+  const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 150;
 
-  renderSingleEvent(evt);
-  applyFilters();
+  renderSingleEvent(evt, container);
+  if (container === trace) applyFilters();
 
   if (nearBottom) {
-    trace.scrollTop = trace.scrollHeight;
+    container.scrollTop = container.scrollHeight;
   }
 }
+
+// ── Dashboard mode ──────────────────────────────────────────────────
+
+function enterDashboard() {
+  dashboardMode = true;
+  btnDashboard.classList.add("active");
+  trace.classList.add("hidden");
+  sidebar.classList.add("hidden");
+  dashboard.classList.remove("hidden");
+  dashboard.innerHTML = "";
+  panelStates.clear();
+
+  // Create panels for all active sessions
+  for (const sid of activeSessions) {
+    createDashboardPanel(sid);
+  }
+
+  if (dashboard.children.length === 0) {
+    dashboard.innerHTML = '<div class="no-sessions">No active sessions. Start a run with --log --stream.</div>';
+  }
+
+  // Subscribe to all sessions
+  wsSend({ type: "subscribe_all" });
+}
+
+function exitDashboard() {
+  dashboardMode = false;
+  btnDashboard.classList.remove("active");
+  dashboard.classList.add("hidden");
+  dashboard.innerHTML = "";
+  sidebar.classList.remove("hidden");
+  trace.classList.remove("hidden");
+  panelStates.clear();
+
+  // Unsubscribe all, re-subscribe to active session if any
+  wsSend({ type: "unsubscribe_all" });
+  if (activeSessionId) {
+    wsSend({ type: "subscribe", sessionId: activeSessionId });
+  }
+}
+
+function toggleDashboard() {
+  if (dashboardMode) {
+    exitDashboard();
+  } else {
+    enterDashboard();
+  }
+}
+
+function createDashboardPanel(sessionId) {
+  if (dashboard.querySelector(`[data-session-id="${sessionId}"]`)) return;
+
+  // Find session info for label
+  const sessionInfo = sessions.find((s) => s.sessionId === sessionId);
+  const label = sessionInfo?.taskId || sessionId;
+
+  const panel = mk("div", "dashboard-panel");
+  panel.dataset.sessionId = sessionId;
+  panel.innerHTML =
+    '<div class="panel-header">' +
+    '<span>' + esc(label) + '</span>' +
+    '<span class="panel-status">LIVE</span>' +
+    '</div>' +
+    '<div class="panel-body" data-session-id="' + esc(sessionId) + '"></div>';
+
+  // Click header to switch to single-session view
+  panel.querySelector(".panel-header").addEventListener("click", () => {
+    exitDashboard();
+    loadTrace(sessionId);
+  });
+
+  dashboard.appendChild(panel);
+
+  // Create panel state
+  panelStates.set(sessionId, {
+    turnCount: 0,
+    streamingEl: null,
+    streamingText: "",
+    streamingThinking: "",
+  });
+}
+
+function getDashboardBody(sessionId) {
+  return dashboard.querySelector(`.panel-body[data-session-id="${sessionId}"]`);
+}
+
+btnDashboard.addEventListener("click", toggleDashboard);
 
 // ── WebSocket client ────────────────────────────────────────────────
 
 let ws = null;
+let replayingSession = null; // sessionId currently being replayed
+
+function wsSend(msg) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(msg));
+  }
+}
 
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(proto + "//" + location.host + "/ws");
+
+  ws.onopen = () => {
+    // Re-subscribe after reconnect
+    if (dashboardMode) {
+      wsSend({ type: "subscribe_all" });
+    } else if (activeSessionId) {
+      wsSend({ type: "subscribe", sessionId: activeSessionId });
+    }
+  };
 
   ws.onmessage = (e) => {
     let msg;
@@ -451,13 +610,42 @@ function connectWS() {
       case "session_active": {
         activeSessions.add(msg.sessionId);
         refreshSessions();
+        if (dashboardMode) {
+          createDashboardPanel(msg.sessionId);
+          // Remove "no sessions" placeholder
+          const placeholder = dashboard.querySelector(".no-sessions");
+          if (placeholder) placeholder.remove();
+          wsSend({ type: "subscribe", sessionId: msg.sessionId });
+        }
+        break;
+      }
+
+      case "replay_start": {
+        replayingSession = msg.sessionId;
+        break;
+      }
+
+      case "replay_end": {
+        replayingSession = null;
+        break;
+      }
+
+      case "replay_complete": {
+        replayingSession = null;
         break;
       }
 
       case "event": {
         if (msg.event?.ts) updateLastEvent(msg.event.ts);
-        if (msg.sessionId === activeSessionId) {
-          appendLiveEvent(msg.event);
+
+        if (dashboardMode) {
+          // Route to correct dashboard panel
+          const body = getDashboardBody(msg.sessionId);
+          if (body) {
+            appendLiveEvent(msg.event, body);
+          }
+        } else if (msg.sessionId === activeSessionId) {
+          appendLiveEvent(msg.event, trace);
         }
         break;
       }
@@ -465,8 +653,20 @@ function connectWS() {
       case "session_ended": {
         activeSessions.delete(msg.sessionId);
         renderSidebar();
-        // Reload full trace for clean final render
-        if (msg.sessionId === activeSessionId) {
+
+        if (dashboardMode) {
+          // Mark panel as ended
+          const panel = dashboard.querySelector(`.dashboard-panel[data-session-id="${msg.sessionId}"]`);
+          if (panel) {
+            const status = panel.querySelector(".panel-status");
+            if (status) {
+              status.textContent = "ENDED";
+              status.style.animation = "none";
+              status.style.color = "var(--fg-dim)";
+            }
+          }
+        } else if (msg.sessionId === activeSessionId) {
+          // Reload full trace for clean final render
           loadTrace(activeSessionId);
         }
         break;
@@ -600,6 +800,10 @@ document.addEventListener("keydown", (e) => {
       const cb = document.getElementById("f-sysprompt");
       cb.checked = !cb.checked;
       applyFilters();
+      break;
+    }
+    case "d": {
+      toggleDashboard();
       break;
     }
   }
