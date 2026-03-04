@@ -3,7 +3,6 @@
 ## Strategies and Hard Rules
 
 - **Token depth = accuracy for agentic solvers** — On ARC-AGI-2, 3.5x more tokens/attempt → 20pp more accuracy (594k tokens at 65.8% vs 2M tokens at 85.3%). Same model, same reasoning level. When reproducing results, match token expenditure not just configuration flags. Check turn limits, timeouts, and action budgets — these gate exploration depth.
-- **Explore unfamiliar data with python3 one-liners before coding the transformer** — For JSONL/JSON data transformation tasks, run 3-5 python3 one-liners to: count event types, print one example of each, trace join keys between files. Takes ~90 seconds, eliminates all guesswork.
 - **Arcgentica's `success` field is self-eval, not ground truth** — Their attempt JSON `test_results[].success` reflects the agent's internal check, not whether the output matches the ARC answer key. Actual scoring requires running `score.py` against the solutions.
 
 - **Edit existing files, Write only new ones** — For files that already exist, always use Read → Edit, even if the spec says to "update" them. Reserve Write for files that genuinely don't exist yet. The Write tool can error on existing files if they weren't Read first in the current session. Before creating any file, Glob for it first — prior sessions may have already created it.
@@ -17,6 +16,8 @@
 - **Combine tasks that touch the same file** — When two tasks both modify the same file (like pass@K scoring + default model/thinking both in `arc-runner.ts`), implement them together. Avoids re-reading/re-editing and produces cleaner diffs.
 - **Explore unfamiliar data with python3 one-liners before coding the transformer** — For JSONL/JSON data transformation tasks, run 3-5 python3 one-liners to: (1) count event types, (2) print one example of each type, (3) trace the join keys between files, (4) verify assumptions about field presence. This takes ~90 seconds and eliminates all guesswork from the implementation.
 - **Test the full pipeline on real data, not just each stage** — For multi-stage pipelines (A→B→C), run the entire pipeline end-to-end before shipping. Stage-level validation (A→B looks correct, B→C looks correct) can miss information loss at boundaries. The trace-export session caught a missing `system_prompt` only when running session→rollout→sharegpt as a complete pipeline.
+- **Translate at the API boundary, not at every consumer** — When changing a data format (e.g., event-stream → message-log), add a server-side converter that emits the old format rather than rewriting all frontend/consumer code. This preserves working code and makes the migration incremental. (Demonstrated by `convertMessagesToEvents()` saving ~300 lines of frontend rewrite.)
+- **Build `dist/` before cross-package typecheck** — After modifying `pi-rlm/src/`, run `cd pi-rlm && bun tsc -p tsconfig.json` before running `cd domains/arc-agi-2 && bun tsc --noEmit`. The workspace dependency resolves via `dist/`, not source. `bun tsc --noEmit` validates types but doesn't produce output files.
 
 ## Code Patterns
 
@@ -32,6 +33,8 @@
 - **Shared mutable counter for flat resource pools** — `{ count: number }` object passed by reference through all `createSpawnAgent` levels gives a flat pool counter in ~10 lines. Works because JS objects are pass-by-reference. Simpler than depth tracking for "total N agents" limits (vs "N levels deep" limits).
 - **SessionLogger `message_end` with `usage` = assistant turn** — The session logger echoes both assistant messages and user/tool-result messages as `message_end` events. The discriminator: assistant turns have a `usage` field (input/output token counts); echo messages don't. This is the key for reconstructing conversations from JSONL.
 - **Content blocks use `toolCall` not `tool_use`** — pi-agent-core serializes tool calls as `{type: "toolCall", arguments: {code}}`, not the Anthropic API's `{type: "tool_use"}`. The trace converter handles both for robustness.
+- **Orchestrator root agent needs separate snapshot** — The Orchestrator creates the root `Agent` directly (not via `AgentHandle`), so cross-cutting hooks like message snapshotting must be added in both `AgentHandle.call()` and `Orchestrator.run()`. When adding behavior that should apply to "every agent," check both code paths.
+- **`SessionDir` + `AgentLogger` for persistent per-agent logs** — `SessionDir` manages `logs/{domain}/{session_id}/` with auto-incrementing agent indices. `AgentLogger` writes per-agent JSONL (`agent-N.jsonl`) with `{type:"session"}` header, `{type:"message"}` entries, and `{type:"session_end"}` footer. The old `SessionLogger` (event-stream) is kept only for `cli.ts` and `trace-export.ts`.
 
 ## Pitfalls
 
@@ -49,6 +52,8 @@
 - **Predict signal-to-noise, not raw size** — When predicting whether a refactored prompt/config will be "shorter," the real metric is "no irrelevant content," not "fewer characters." A domain-specific prompt can be longer than a generic one and still be better because every byte is task-relevant. Frame predictions around content relevance, not length.
 - **Keyword-matching for banned prompt content needs context** — ARC_PREMISE uses "delegate" in "do not delegate unless genuinely helpful" — this is solver-appropriate language telling the agent NOT to delegate, not orchestrator framing. Checking prompts for banned words requires understanding context, not just substring matching.
 - **Intermediate formats must carry downstream metadata** — When format X feeds into format Y, X must carry everything Y needs — not just what X's own spec requires. The sparse-v1.0 Rollout spec doesn't include `system_prompt` at the top level (it's in Steps), but the ShareGPT exporter needs it. Check data flow through the full pipeline before finalizing schemas.
+- **Termination protocol `git add -A` conflicts with playbook** — The hardcoded `git add -A && git commit` in the termination template conflicts with the "stage specific files" rule. When following a template that says `git add -A`, override it with specific file staging. The template instruction is generic; the playbook rule is project-specific and takes priority.
+- **Spec removal tasks need consumer grep first** — Before writing a "remove X" task in a PROMPT spec, run `grep -r 'X' --include='*.ts'` to enumerate all consumers. The session-logs spec said to remove `SessionLogger` but missed `cli.ts` and `trace-export.ts` as dependents. Discovering this at implementation time is wasteful — discover it at spec time.
 
 ## Environment
 
@@ -57,7 +62,7 @@
 - **ARC-AGI-2 data** — `downloads/ARC-AGI-2/data/training/` (1000 tasks), `downloads/ARC-AGI-2/data/evaluation/` (120 tasks). Task files are `{id}.json` with `{train: [{input, output}], test: [{input, output}]}`.
 - **ARC runner** — `bun pi-rlm/src/arc-runner.ts --count 5 --debug` for dev validation. Supports `--model`, `--thinking`, `--task-id`, `--split`, `--log`, `--num-attempts <n>` (default 2), `--max-agents <n>` (default 10), `--shard <n> --num-shards <n>` for parallel runs. Defaults to `claude-opus-4-6` model and `high` thinking. Auth: uses `ANTHROPIC_API_KEY` from `.env` if set, falls back to OAuth.
 - **ARC eval results (Feb 28 2026)** — 79/120 (65.8%) on eval split with Opus + high + pass@2. Results: `pi-rlm/results/arc/2026-02-28T17-56-02-573Z-merged.json`. Arcgentica comparison: 85.3% (102.3/120). Gap analysis: `NEXT-gap-analysis.md`.
-- **Trace export CLI** — `bun pi-rlm/src/trace-export.ts` with `rollout` and `sharegpt` subcommands. Converts session JSONL → sparse-v1.0 Rollout → ShareGPT for SFT. See `NEXT-sft-export.md`.
 - **Sharded parallel runs** — `pi-rlm/run-eval-sharded.sh` launches 10 parallel workers. Merge with `bun src/merge-results.ts results/arc/*shard*.json`.
-- **Test count: 158 tests across 12 files** — Includes 11 REPL coherence tests for `let`/`const` persistence, re-declaration, cross-eval access, iterative refinement, error recovery, and mixed declarations. Plus 4 tests for system prompt override and flat agent pool.
+- **Test count: 160 tests (112 pi-rlm + 48 domain)** — pi-rlm includes 11 REPL coherence tests, 4 system prompt override tests, flat agent pool tests. Domain package has its own test suite at `domains/arc-agi-2/test/`.
 - **Trace export CLI** — `bun pi-rlm/src/trace-export.ts` with two subcommands: `rollout` (session JSONL → sparse-v1.0 Rollout JSONL) and `sharegpt` (Rollout or sessions → ShareGPT JSONL for SFT). Supports `--filter correct|all|wrong`. Direct pipeline: `sharegpt --sessions <dir> --results <file> --out <file>`.
+- **Domain package workspace dependency** — `domains/arc-agi-2` depends on `pi-rlm` via `"pi-rlm": "workspace:*"` with `main: "./dist/index.js"`. Changes to pi-rlm exports require a `tsc` build before domain typecheck passes.
