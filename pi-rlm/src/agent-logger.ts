@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, appendFileSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { UsageTracker } from "./usage-tracker.js";
@@ -76,6 +76,40 @@ export class AgentLogger {
 	/** Path to the log file. */
 	get logPath(): string {
 		return this.filePath;
+	}
+
+	/**
+	 * Load AgentMessage entries from a JSONL log file.
+	 * Returns all messages from `type: "message"` entries, skipping
+	 * session headers and session_end lines.
+	 */
+	static loadMessages(filePath: string): AgentMessage[] {
+		const content = readFileSync(filePath, "utf-8");
+		const messages: AgentMessage[] = [];
+		for (const line of content.split("\n")) {
+			if (!line) continue;
+			const entry = JSON.parse(line);
+			if (entry.type === "message") {
+				messages.push(entry.message as AgentMessage);
+			}
+		}
+		return messages;
+	}
+
+	/**
+	 * Load the session header metadata from a JSONL log file.
+	 * Returns the metadata object from the first `type: "session"` entry.
+	 */
+	static loadSessionMetadata(filePath: string): Record<string, unknown> {
+		const content = readFileSync(filePath, "utf-8");
+		for (const line of content.split("\n")) {
+			if (!line) continue;
+			const entry = JSON.parse(line);
+			if (entry.type === "session") {
+				return (entry.metadata ?? {}) as Record<string, unknown>;
+			}
+		}
+		return {};
 	}
 
 	private writeLine(obj: Record<string, unknown>): void {

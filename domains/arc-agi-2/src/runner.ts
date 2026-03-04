@@ -20,21 +20,21 @@
  *   --label <name>         Label suffix for result files (e.g. "retry")
  *   --shard <n>            Shard index for parallel runs (0-based)
  *   --num-shards <n>       Total number of shards
- *   --debug                Enable debug TUI
+ *   --resume <session-id>  Resume an aborted session
  *   --stream               Stream agent output to stdout
- *   --log                  Enable session logging
+ *   --no-log               Disable session logging
  */
 
 import { getModel, streamSimple } from "@mariozechner/pi-ai";
 import type { AssistantMessageEvent } from "@mariozechner/pi-ai";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { Orchestrator, OrchestratorTUI, createOAuthResolver, SessionDir } from "pi-rlm";
+import { Orchestrator, OrchestratorTUI, createOAuthResolver, SessionDir, AgentLogger } from "pi-rlm";
 import type { TaggedAgentEvent } from "pi-rlm";
 import { createArcAdapter } from "./adapter.js";
 import { loadTask, loadTasksFromDir, selectDevSet } from "./task-loader.js";
 import { accuracy } from "./grid-helpers.js";
 import type { ArcGrid, ArcAttempt, ArcResult } from "./types.js";
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 // ── Stream handler ──
@@ -131,10 +131,10 @@ const shard = parseInt(getArg("--shard", "-1"), 10);
 const numShards = parseInt(getArg("--num-shards", "1"), 10);
 const taskIdsFile = getArg("--task-ids-file", "");
 const label = getArg("--label", "");
+const resumeSessionId = getArg("--resume", "");
 const allTasks = args.includes("--all");
-const debug = args.includes("--debug");
 const stream = args.includes("--stream");
-const logEnabled = args.includes("--log");
+const logEnabled = !args.includes("--no-log");
 
 // Resolve log/results dirs relative to repo root
 const resolvedLogDir = join(repoRoot, logDir);
@@ -149,8 +149,33 @@ interface TaskEntry {
 	task: ReturnType<typeof loadTask>;
 }
 
+// ── Resume mode: resolve agent log path and extract task info ──
+
+let resumeAgentLogPath: string | undefined;
+let resumeMetadata: Record<string, unknown> | undefined;
+
+if (resumeSessionId) {
+	resumeAgentLogPath = join(resolvedLogDir, resumeSessionId, "agent-0.jsonl");
+	if (!existsSync(resumeAgentLogPath)) {
+		console.error(`Resume log not found: ${resumeAgentLogPath}`);
+		process.exit(1);
+	}
+	resumeMetadata = AgentLogger.loadSessionMetadata(resumeAgentLogPath);
+}
+
 let tasks: TaskEntry[];
-if (taskIdsFile) {
+if (resumeSessionId && resumeMetadata) {
+	// In resume mode, extract taskId from session metadata
+	const resumeTaskId = (taskId || resumeMetadata.taskId) as string;
+	if (!resumeTaskId) {
+		console.error("Cannot determine task ID for resume. Provide --task-id or ensure session metadata contains taskId.");
+		process.exit(1);
+	}
+	const resumeSplit = (resumeMetadata.split as string) || split;
+	const resumeSplitDir = join(dataDir, resumeSplit);
+	const task = loadTask(join(resumeSplitDir, `${resumeTaskId}.json`));
+	tasks = [{ id: resumeTaskId, task }];
+} else if (taskIdsFile) {
 	const ids = readFileSync(taskIdsFile, "utf-8").split("\n").map(s => s.trim()).filter(Boolean);
 	tasks = ids.map(id => ({ id, task: loadTask(join(splitDir, `${id}.json`)) }));
 } else if (taskId) {
@@ -220,21 +245,24 @@ for (let i = 0; i < tasks.length; i++) {
 			},
 		});
 
-		if (debug) {
-			tui = new OrchestratorTUI({
-				debug: true,
-				usageTracker: orchestrator.getUsageTracker(),
-			});
-			tui.start();
-		}
+		tui = new OrchestratorTUI({
+			debug: true,
+			usageTracker: orchestrator.getUsageTracker(),
+		});
+		tui.start();
 
 		const startTime = Date.now();
 		let resolvedValue: unknown;
 		let runError: string | undefined;
 		try {
-			resolvedValue = await orchestrator.run(
-				"Analyze the training examples, discover the transformation rule, write a `transform(grid)` function, test it on ALL training examples until accuracy=1.0, then resolve with the transform function.",
-			);
+			if (resumeAgentLogPath && a === 0) {
+				// Resume mode: restore conversation from prior session log
+				resolvedValue = await orchestrator.resume(resumeAgentLogPath);
+			} else {
+				resolvedValue = await orchestrator.run(
+					"Analyze the training examples, discover the transformation rule, write a `transform(grid)` function, test it on ALL training examples until accuracy=1.0, then resolve with the transform function.",
+				);
+			}
 		} catch (err) {
 			runError = String(err);
 			console.error(`    Error: ${err}`);

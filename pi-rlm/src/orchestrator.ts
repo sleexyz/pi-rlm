@@ -8,7 +8,7 @@ import { generateSystemPrompt } from "./system-prompt.js";
 import { createTaggedOnEvent, type TaggedAgentEvent } from "./event-tagging.js";
 import { UsageTracker } from "./usage-tracker.js";
 import type { SessionDir } from "./session-dir.js";
-import type { AgentLogger } from "./agent-logger.js";
+import { AgentLogger } from "./agent-logger.js";
 
 export interface OrchestratorOptions {
 	/** Model for the main orchestrator agent. */
@@ -175,6 +175,16 @@ export class Orchestrator {
 		if (tagged.handler) {
 			this.agent.subscribe(tagged.handler);
 		}
+
+		// Incremental message logging: snapshot after each turn
+		if (this.agentLogger) {
+			const logger = this.agentLogger;
+			this.agent.subscribe((event) => {
+				if (event.type === "turn_end") {
+					logger.snapshotMessages(this.agent.state.messages);
+				}
+			});
+		}
 	}
 
 	/**
@@ -235,5 +245,51 @@ export class Orchestrator {
 	/** Get the root agent logger (if session logging is enabled). */
 	getAgentLogger(): AgentLogger | undefined {
 		return this.agentLogger;
+	}
+
+	/**
+	 * Resume from an aborted session by restoring conversation state
+	 * from a prior agent log file.
+	 *
+	 * @param agentLogPath - Path to agent-0.jsonl from the aborted session
+	 * @param initialObjects - Optional objects to inject into scope
+	 * @returns The resolved value, or undefined if rejected/not resolved
+	 */
+	async resume(agentLogPath: string, initialObjects?: Record<string, unknown>): Promise<unknown> {
+		const messages = AgentLogger.loadMessages(agentLogPath);
+
+		if (initialObjects) {
+			this.runtime.injectScope(initialObjects);
+		}
+
+		this.resolved = false;
+		this.resolvedValue = undefined;
+		this.rejected = false;
+		this.rejectionReason = undefined;
+
+		// Restore prior conversation state
+		this.agent.replaceMessages(messages);
+
+		// Update logger so it doesn't re-log restored messages
+		if (this.agentLogger) {
+			this.agentLogger.snapshotMessages(messages);
+		}
+
+		const resumeMessage =
+			"Your previous session was interrupted. Your eval scope has been reset — re-define any variables or functions you need. Continue working on the task.";
+
+		this.taggedOnEvent.setUserMessage(resumeMessage);
+		await this.agent.prompt(resumeMessage);
+
+		// Snapshot new messages for logging
+		if (this.agentLogger) {
+			this.agentLogger.snapshotMessages(this.agent.state.messages);
+		}
+
+		if (this.rejected) {
+			throw new Error(`Agent rejected: ${this.rejectionReason}`);
+		}
+
+		return this.resolvedValue;
 	}
 }
