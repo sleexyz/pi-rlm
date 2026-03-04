@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { loadTask, loadTasksFromDir, selectDevSet } from "../../src/arc/task-loader.js";
+import { loadTask, loadTasksFromDir, selectDevSet } from "../src/task-loader.js";
 import { join } from "node:path";
 
-const DATA_DIR = join(process.cwd(), "../downloads/ARC-AGI-2/data/training");
+const DATA_DIR = join(import.meta.dirname, "../../../downloads/ARC-AGI-2/data/training");
 
 describe("loadTask", () => {
 	it("loads a valid ARC task from JSON", () => {

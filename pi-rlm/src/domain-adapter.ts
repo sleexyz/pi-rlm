@@ -1,36 +1,25 @@
 /**
- * Interface for domain plugins. Any domain (ARC-AGI, code generation, etc.)
- * plugs into the orchestrator by implementing this interface.
+ * A Adapter is the complete description of a problem space.
+ * The framework assembles the system prompt, wires up eval + spawnAgent + resolve/reject.
+ * Everything else is domain scope.
  */
-export interface DomainAdapter {
-	/** Domain name used in system prompt context. */
+export interface Adapter {
+	/** Adapter name (used in system prompt heading). */
 	name: string;
 
-	/** Domain reference documentation (equivalent to GAME_REFERENCE). */
-	reference: string;
-
-	/** Orchestrator role/instructions (equivalent to premise()). */
+	/** Agent instructions — the core of the system prompt. */
 	premise: string;
 
-	/** Domain-specific objects to inject into the eval scope. */
-	getScope(): Record<string, unknown>;
+	/** SDK/API reference docs. Also exposed as `DOMAIN_REFERENCE` in eval scope. */
+	reference: string;
 
-	/** Optional check for whether the domain task is complete. */
-	isComplete?(): boolean;
+	/** System prompt for sub-agents spawned via `spawnAgent()` with no args.
+	 *  `spawnAgent("custom")` bypasses this and uses the custom prompt as-is. */
+	defaultSubAgentPrompt?: string;
 
-	/** Optional status line appended to eval results (e.g., current score, level). */
-	getStatus?(): string;
+	/** Everything the agent can use — helpers, data, libraries, whatever the domain needs. */
+	scope: Record<string, unknown>;
 
-	/**
-	 * Names of scope functions that are domain "actions" (trackable, budgetable).
-	 * If omitted, no functions are auto-tracked in the action history.
-	 */
-	actionNames?: string[];
-
-	/**
-	 * Optional custom system prompt generator. When provided, bypasses the
-	 * default orchestrator system prompt (generateSystemPrompt in system-prompt.ts).
-	 * Used by domains like ARC-AGI-2 that act as direct solvers, not orchestrators.
-	 */
-	generateSystemPrompt?(): string;
+	/** Optional string appended to every eval result (e.g., game score, budget remaining). */
+	onEvalResult?: () => string | undefined;
 }

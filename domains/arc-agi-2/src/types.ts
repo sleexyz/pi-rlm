@@ -17,6 +17,8 @@ export interface ArcTask {
 export interface ArcAttempt {
 	predicted: ArcGrid;
 	correct: boolean;
+	failed?: boolean;
+	error?: string;
 	cost: number;
 	tokens: number;
 	timeMs: number;
@@ -26,6 +28,7 @@ export interface ArcAttempt {
 export interface ArcResult {
 	taskId: string;
 	correct: boolean;
+	failed?: boolean;
 	attempts: ArcAttempt[];
 	expected: ArcGrid;
 	cost: number;

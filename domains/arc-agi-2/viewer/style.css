@@ -133,8 +133,9 @@ header h1 {
   margin-left: 6px;
 }
 
-.badge.ok  { background: rgba(74,222,128,0.2); color: var(--green); }
-.badge.err { background: rgba(248,113,113,0.2); color: var(--red); }
+.badge.ok   { background: rgba(74,222,128,0.2); color: var(--green); }
+.badge.err  { background: rgba(248,113,113,0.2); color: var(--red); }
+.badge.fail { background: rgba(251,191,36,0.2); color: var(--yellow); }
 .badge.live {
   background: rgba(34, 211, 238, 0.2);
   color: var(--cyan);
@@ -143,6 +144,28 @@ header h1 {
 @keyframes live-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
+}
+
+.domain-header {
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+.domain-tag {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-left: 6px;
+  background: rgba(96, 165, 250, 0.15);
+  color: var(--blue);
 }
 
 /* Trace view */
@@ -205,6 +228,12 @@ header h1 {
   margin-bottom: 8px;
 }
 
+.ts {
+  float: right;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
 .agent-footer {
   color: var(--fg-dim);
   border-top: 1px solid var(--border);
@@ -254,6 +283,14 @@ pre {
   word-break: break-word;
   font-family: inherit;
   font-size: inherit;
+}
+
+.streaming-text::after {
+  content: "\2588";
+  animation: blink 1s step-end infinite;
+}
+@keyframes blink {
+  50% { opacity: 0; }
 }
 
 .no-sessions {

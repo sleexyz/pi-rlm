@@ -5,6 +5,9 @@ let resultMap = {}; // taskId -> { correct, cost, tokens, model }
 let activeSessionId = null;
 let currentTurnCount = 0;
 let activeSessions = new Set();
+let streamingEl = null; // live-updating element for message_update deltas
+let streamingText = "";
+let streamingThinking = "";
 
 const sidebar = document.getElementById("sidebar");
 const trace = document.getElementById("trace");
@@ -23,7 +26,7 @@ async function init() {
   for (const rf of resData) {
     const model = rf.config?.model || "";
     for (const r of rf.results) {
-      resultMap[r.taskId] = { correct: r.correct, cost: r.cost, tokens: r.tokens, model };
+      resultMap[r.taskId] = { correct: r.correct, failed: r.failed, cost: r.cost, tokens: r.tokens, model };
     }
   }
 
@@ -45,8 +48,23 @@ function renderSidebar() {
     return;
   }
 
-  sidebar.innerHTML = sessions
-    .map((s) => {
+  // Group sessions by domain
+  const grouped = {};
+  for (const s of sessions) {
+    const d = s.domain || "unknown";
+    if (!grouped[d]) grouped[d] = [];
+    grouped[d].push(s);
+  }
+
+  const domains = Object.keys(grouped).sort();
+  const multiDomain = domains.length > 1;
+
+  let html = "";
+  for (const domain of domains) {
+    if (multiDomain) {
+      html += '<div class="domain-header">' + esc(domain) + "</div>";
+    }
+    for (const s of grouped[domain]) {
       const label = s.taskId || s.sessionId;
       const result = s.taskId ? resultMap[s.taskId] : null;
       const isLive = activeSessions.has(s.sessionId);
@@ -55,8 +73,13 @@ function renderSidebar() {
         : result
           ? result.correct
             ? '<span class="badge ok">CORRECT</span>'
-            : '<span class="badge err">WRONG</span>'
+            : result.failed
+              ? '<span class="badge fail">FAILED</span>'
+              : '<span class="badge err">WRONG</span>'
           : "";
+      const domainTag = !multiDomain && s.domain
+        ? '<span class="domain-tag">' + esc(s.domain) + "</span>"
+        : "";
       const cost = s.usage ? "$" + s.usage.totalCost.toFixed(4) : "";
       const tokens = s.usage ? s.usage.totalTokens.toLocaleString() + " tok" : "";
       const model = s.model || (result && result.model) || "";
@@ -65,22 +88,23 @@ function renderSidebar() {
       const line1 = [s.turns + " turns", cost, tokens].filter(Boolean).join(" \u00b7 ");
       const line2 = [modelShort, date].filter(Boolean).join(" \u00b7 ");
 
-      return (
+      html +=
         '<div class="session-item" data-id="' +
         esc(s.sessionId) +
         '">' +
         '<span class="task-id">' +
         esc(label) +
         "</span>" +
+        domainTag +
         badge +
         '<div class="meta">' +
         esc(line1) +
         "</div>" +
         (line2 ? '<div class="meta">' + esc(line2) + "</div>" : "") +
-        "</div>"
-      );
-    })
-    .join("");
+        "</div>";
+    }
+  }
+  sidebar.innerHTML = html;
 
   sidebar.querySelectorAll(".session-item").forEach((el) => {
     el.addEventListener("click", () => loadTrace(el.dataset.id));
@@ -134,11 +158,13 @@ function renderSingleEvent(evt) {
       const idTag = evt.agentId != null ? "#" + evt.agentId + " " : "";
 
       const div = mk("div", "event verbose " + depthClass);
+      const ts = evt.ts ? " " + timeStr(evt.ts) : "";
       div.innerHTML =
         '<div class="agent-header">\u250c\u2500 ' +
         esc(idTag + label) +
         " " +
         "\u2500".repeat(Math.max(0, 50 - (idTag + label).length)) +
+        '<span class="ts">' + esc(ts) + '</span>' +
         "</div>";
 
       if (evt.systemPrompt) {
@@ -167,13 +193,62 @@ function renderSingleEvent(evt) {
       if (currentTurnCount > 1) {
         const hr = document.createElement("hr");
         hr.className = "turn-sep verbose";
-        hr.dataset.turn = "Turn " + currentTurnCount;
+        hr.dataset.turn = "Turn " + currentTurnCount + (evt.ts ? "  " + timeStr(evt.ts) : "");
         trace.appendChild(hr);
       }
       break;
     }
 
+    case "message_update": {
+      if (!evt.delta) break;
+      if (evt.deltaType === "thinking_delta") {
+        streamingThinking += evt.delta;
+        if (!streamingEl) {
+          streamingEl = mk("div", "event " + depthClass);
+          const pre = mk("pre", "thk streaming-text");
+          streamingEl.appendChild(pre);
+          trace.appendChild(streamingEl);
+        }
+        const pre = streamingEl.querySelector(".streaming-text");
+        if (pre) pre.textContent = streamingThinking;
+      } else if (evt.deltaType === "text_delta") {
+        streamingText += evt.delta;
+        // If we were showing thinking, finalize it and start a new element
+        if (streamingThinking && streamingEl) {
+          // Collapse thinking into a details block
+          const thinkPre = streamingEl.querySelector(".streaming-text");
+          if (thinkPre) {
+            const details = document.createElement("details");
+            details.className = "event thk-block " + depthClass;
+            const preview = streamingThinking.split("\n")[0].slice(0, 80);
+            details.innerHTML =
+              '<summary class="thk">THK  ' + esc(preview) + '\u2026</summary>' +
+              '<div class="collapsible-content thk">' + esc(streamingThinking) + '</div>';
+            streamingEl.replaceWith(details);
+          }
+          streamingThinking = "";
+          streamingEl = null;
+        }
+        if (!streamingEl) {
+          streamingEl = mk("div", "event llm " + depthClass);
+          const pre = mk("pre", "llm streaming-text");
+          streamingEl.appendChild(pre);
+          trace.appendChild(streamingEl);
+        }
+        const pre = streamingEl.querySelector(".streaming-text");
+        if (pre) pre.textContent = streamingText;
+      }
+      break;
+    }
+
     case "message_end": {
+      // Clear streaming state — message_end has the final content
+      streamingText = "";
+      streamingThinking = "";
+      if (streamingEl) {
+        streamingEl.remove();
+        streamingEl = null;
+      }
       if (!evt.content) break;
 
       for (const block of evt.content) {
@@ -300,6 +375,9 @@ function renderTrace(events) {
   trace.className = "";
   trace.innerHTML = "";
   currentTurnCount = 0;
+  streamingEl = null;
+  streamingText = "";
+  streamingThinking = "";
 
   const turnFilter = parseInt(document.getElementById("f-turn").value, 10);
   let turnNum = 0;
@@ -377,6 +455,7 @@ function connectWS() {
       }
 
       case "event": {
+        if (msg.event?.ts) updateLastEvent(msg.event.ts);
         if (msg.sessionId === activeSessionId) {
           appendLiveEvent(msg.event);
         }
@@ -416,6 +495,11 @@ function mk(tag, cls) {
 function esc(s) {
   if (!s) return "";
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function timeStr(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function friendlyDate(ts) {
@@ -520,6 +604,27 @@ document.addEventListener("keydown", (e) => {
     }
   }
 });
+
+// ── Last event indicator ─────────────────────────────────────────────
+
+let lastEventTs = 0;
+const lastEventEl = document.getElementById("last-event");
+
+function updateLastEvent(ts) {
+  if (ts && ts > lastEventTs) lastEventTs = ts;
+}
+
+setInterval(() => {
+  if (!lastEventTs || !activeSessions.has(activeSessionId)) {
+    lastEventEl.textContent = "";
+    return;
+  }
+  const ago = Math.floor((Date.now() / 1000) - lastEventTs);
+  if (ago < 5) lastEventEl.textContent = "streaming...";
+  else if (ago < 60) lastEventEl.textContent = ago + "s since last event";
+  else lastEventEl.textContent = Math.floor(ago / 60) + "m " + (ago % 60) + "s since last event";
+  lastEventEl.style.color = ago > 120 ? "var(--red)" : ago > 30 ? "var(--yellow)" : "var(--green)";
+}, 1000);
 
 // ── Init ────────────────────────────────────────────────────────────
 

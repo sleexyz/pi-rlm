@@ -1,26 +1,25 @@
 import { describe, it, expect } from "vitest";
 import { Orchestrator } from "../src/orchestrator.js";
 import { generateSystemPrompt } from "../src/system-prompt.js";
-import type { DomainAdapter } from "../src/domain-adapter.js";
+import type { Adapter } from "../src/domain-adapter.js";
 import { getModel } from "@mariozechner/pi-ai";
 
 const model = getModel("anthropic", "claude-sonnet-4-6");
 
-function makeToyAdapter(): DomainAdapter {
+function makeToyAdapter(): Adapter {
 	return {
-		name: "TestDomain",
-		reference: "This is a test domain. The answer is always 42.",
+		name: "TestAdapter",
 		premise: "You are an orchestrator for a test domain.",
-		getScope: () => ({
+		reference: "This is a test domain. The answer is always 42.",
+		scope: {
 			getAnswer: () => 42,
-		}),
-		isComplete: () => false,
-		getStatus: () => "Status: running",
+		},
+		onEvalResult: () => "Status: running",
 	};
 }
 
 describe("generateSystemPrompt", () => {
-	it("includes adapter premise", () => {
+	it("includes domain premise", () => {
 		const adapter = makeToyAdapter();
 		const prompt = generateSystemPrompt(adapter);
 		expect(prompt).toContain("orchestrator for a test domain");
@@ -32,7 +31,6 @@ describe("generateSystemPrompt", () => {
 		expect(prompt).toContain("spawnAgent");
 		expect(prompt).toContain("resolve");
 		expect(prompt).toContain("reject");
-		expect(prompt).toContain("memories");
 		expect(prompt).toContain("eval");
 	});
 
@@ -47,7 +45,7 @@ describe("generateSystemPrompt", () => {
 	it("includes domain reference", () => {
 		const adapter = makeToyAdapter();
 		const prompt = generateSystemPrompt(adapter);
-		expect(prompt).toContain("TestDomain Reference");
+		expect(prompt).toContain("TestAdapter Reference");
 		expect(prompt).toContain("answer is always 42");
 	});
 });
@@ -57,7 +55,6 @@ describe("Orchestrator", () => {
 		const adapter = makeToyAdapter();
 		const orch = new Orchestrator({ model, adapter });
 		expect(orch.getAgent()).toBeTruthy();
-		expect(orch.getMemories()).toBeTruthy();
 		expect(orch.getRuntime()).toBeTruthy();
 	});
 
@@ -85,14 +82,6 @@ describe("Orchestrator", () => {
 		expect(result.returnValue).toBe("function");
 	});
 
-	it("injects memories into runtime", async () => {
-		const adapter = makeToyAdapter();
-		const orch = new Orchestrator({ model, adapter });
-		const rt = orch.getRuntime();
-		const result = await rt.eval("typeof memories.add");
-		expect(result.returnValue).toBe("function");
-	});
-
 	it("injects resolve into runtime", async () => {
 		const adapter = makeToyAdapter();
 		const orch = new Orchestrator({ model, adapter });
@@ -109,12 +98,20 @@ describe("Orchestrator", () => {
 		expect(result.returnValue).toBe("function");
 	});
 
-	it("sets system prompt from adapter", () => {
+	it("injects DOMAIN_REFERENCE into runtime", async () => {
+		const adapter = makeToyAdapter();
+		const orch = new Orchestrator({ model, adapter });
+		const rt = orch.getRuntime();
+		const result = await rt.eval("DOMAIN_REFERENCE");
+		expect(result.returnValue).toContain("answer is always 42");
+	});
+
+	it("sets system prompt from domain fields", () => {
 		const adapter = makeToyAdapter();
 		const orch = new Orchestrator({ model, adapter });
 		const sp = orch.getAgent().state.systemPrompt;
 		expect(sp).toContain("orchestrator for a test domain");
-		expect(sp).toContain("TestDomain Reference");
+		expect(sp).toContain("TestAdapter Reference");
 	});
 
 	it("sets thinking level", () => {
@@ -131,25 +128,5 @@ describe("Orchestrator", () => {
 			adapter,
 			onEvent: (e) => events.push(e.type),
 		});
-		// Just verifying it doesn't throw — events are emitted during run()
-	});
-
-	it("uses adapter's generateSystemPrompt when provided", () => {
-		const adapter = makeToyAdapter();
-		adapter.generateSystemPrompt = () => "I am a direct solver, not an orchestrator.";
-		const orch = new Orchestrator({ model, adapter });
-		const sp = orch.getAgent().state.systemPrompt;
-		expect(sp).toBe("I am a direct solver, not an orchestrator.");
-		expect(sp).not.toContain("manager");
-		expect(sp).not.toContain("ORCHESTRATOR");
-	});
-
-	it("falls back to default system prompt without generateSystemPrompt", () => {
-		const adapter = makeToyAdapter();
-		// No generateSystemPrompt set
-		const orch = new Orchestrator({ model, adapter });
-		const sp = orch.getAgent().state.systemPrompt;
-		expect(sp).toContain("ORCHESTRATOR");
-		expect(sp).toContain("manager");
 	});
 });

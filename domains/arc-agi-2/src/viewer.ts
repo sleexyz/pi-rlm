@@ -1,0 +1,753 @@
+#!/usr/bin/env bun
+/**
+ * ARC Trace Viewer — API server for session logs and results.
+ *
+ * Usage: bun domains/arc-agi-2/src/viewer.ts [--port <n>]
+ *
+ * Scans logs/<domain>/ and results/<domain>/ at the repo root for all domains.
+ * Serves JSON APIs consumed by the Vite frontend in domains/arc-agi-2/viewer/.
+ */
+
+import { readdirSync, readFileSync, existsSync, watch, openSync, readSync, closeSync, statSync, mkdirSync, type FSWatcher } from "node:fs";
+import { join, basename } from "node:path";
+import { createServer } from "node:http";
+import { WebSocketServer, type WebSocket } from "ws";
+
+// ── CLI args ────────────────────────────────────────────────────────
+
+const args = process.argv.slice(2);
+const portIdx = args.indexOf("--port");
+const port = portIdx !== -1 && args[portIdx + 1]
+	? parseInt(args[portIdx + 1], 10)
+	: process.env.PORT ? parseInt(process.env.PORT, 10) : 3334;
+
+// Resolve relative to repo root — scan all subdirs of logs/ and results/
+const repoRoot = join(import.meta.dirname, "../../..");
+const LOGS_ROOT = join(repoRoot, "logs");
+const RESULTS_ROOT = join(repoRoot, "results");
+
+/** List subdirectories of a root dir (each subdir is a domain). */
+function listDomains(root: string): string[] {
+	if (!existsSync(root)) return [];
+	return readdirSync(root, { withFileTypes: true })
+		.filter((d) => d.isDirectory())
+		.map((d) => d.name)
+		.sort();
+}
+
+// ── Data helpers ────────────────────────────────────────────────────
+
+interface SessionSummary {
+	sessionId: string;
+	filename: string;
+	domain: string;
+	ts: number;
+	taskId?: string;
+	split?: string;
+	model?: string;
+	turns: number;
+	usage?: { totalTokens: number; totalCost: number };
+	active?: boolean;
+}
+
+function loadAnnotations(logsDir: string): Record<string, { model?: string; taskId?: string }> {
+	const annoPath = join(logsDir, "annotations.json");
+	if (!existsSync(annoPath)) return {};
+	try {
+		const data = JSON.parse(readFileSync(annoPath, "utf-8"));
+		return data.sessions ?? {};
+	} catch {
+		return {};
+	}
+}
+
+function listSessions(): SessionSummary[] {
+	const summaries: SessionSummary[] = [];
+
+	for (const domain of listDomains(LOGS_ROOT)) {
+		const logsDir = join(LOGS_ROOT, domain);
+		const annotations = loadAnnotations(logsDir);
+
+		// New format: session directories containing agent-*.jsonl files
+		const entries = readdirSync(logsDir, { withFileTypes: true });
+		for (const entry of entries) {
+			if (entry.isDirectory()) {
+				const sessionDir = join(logsDir, entry.name);
+				const agent0Path = join(sessionDir, "agent-0.jsonl");
+				if (!existsSync(agent0Path)) continue;
+
+				try {
+					const raw = readFileSync(agent0Path, "utf-8");
+					const lines = raw.split("\n").filter((l) => l.trim());
+					if (lines.length === 0) continue;
+
+					const header = JSON.parse(lines[0]);
+					const last = JSON.parse(lines[lines.length - 1]);
+					const meta = header.metadata ?? {};
+
+					// Count turns: each "user" role message = one turn
+					let turns = 0;
+					for (const line of lines) {
+						try {
+							const entry = JSON.parse(line);
+							if (entry.type === "message" && entry.message?.role === "user") turns++;
+						} catch { /* skip */ }
+					}
+
+					const sid = entry.name;
+					const anno = annotations[sid];
+					const summary: SessionSummary = {
+						sessionId: sid,
+						filename: entry.name,
+						domain,
+						ts: header.timestamp ? Math.floor(new Date(header.timestamp).getTime() / 1000) : 0,
+						taskId: meta.taskId ?? anno?.taskId,
+						split: meta.split,
+						model: meta.model ?? anno?.model,
+						turns,
+					};
+
+					if (last.type === "session_end" && last.usage) {
+						summary.usage = {
+							totalTokens: last.usage.totalTokens ?? 0,
+							totalCost: last.usage.totalCost ?? 0,
+						};
+					}
+
+					if (fileWatcher?.isActive(sid)) {
+						summary.active = true;
+					}
+
+					summaries.push(summary);
+				} catch {
+					// skip malformed
+				}
+				continue;
+			}
+
+			// Legacy format: flat JSONL files
+			if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+				try {
+					const raw = readFileSync(join(logsDir, entry.name), "utf-8");
+					const lines = raw.split("\n").filter((l) => l.trim());
+					if (lines.length === 0) continue;
+
+					const first = JSON.parse(lines[0]);
+					const last = JSON.parse(lines[lines.length - 1]);
+
+					let turns = 0;
+					for (const line of lines) {
+						if (line.includes('"turn_start"')) turns++;
+					}
+
+					const sid = first.sessionId ?? basename(entry.name, ".jsonl");
+					const anno = annotations[sid];
+					const summary: SessionSummary = {
+						sessionId: sid,
+						filename: entry.name,
+						domain,
+						ts: first.ts ?? 0,
+						taskId: first.taskId ?? anno?.taskId,
+						split: first.split,
+						model: first.model ?? anno?.model,
+						turns,
+					};
+
+					if (last.type === "session_end" && last.usage) {
+						summary.usage = {
+							totalTokens: last.usage.totalTokens ?? 0,
+							totalCost: last.usage.totalCost ?? 0,
+						};
+					}
+
+					if (fileWatcher?.isActive(sid)) {
+						summary.active = true;
+					}
+
+					summaries.push(summary);
+				} catch {
+					// skip malformed files
+				}
+			}
+		}
+	}
+
+	// Sort all sessions by timestamp descending
+	summaries.sort((a, b) => b.ts - a.ts);
+	return summaries;
+}
+
+const RENDERABLE_TYPES = new Set([
+	"session_start",
+	"agent_start",
+	"turn_start",
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_end",
+	"agent_end",
+	"session_end",
+]);
+
+/**
+ * Convert per-agent message JSONL files into the event format the frontend expects.
+ * Maps AgentMessage entries to the same event structure used by the old SessionLogger.
+ */
+function convertMessagesToEvents(sessionDir: string): object[] {
+	const events: object[] = [];
+
+	// Find all agent-*.jsonl files
+	const agentFiles = readdirSync(sessionDir)
+		.filter((f) => /^agent-\d+\.jsonl$/.test(f))
+		.sort((a, b) => {
+			const ai = parseInt(a.match(/\d+/)![0]);
+			const bi = parseInt(b.match(/\d+/)![0]);
+			return ai - bi;
+		});
+
+	for (const file of agentFiles) {
+		const agentIndex = parseInt(file.match(/\d+/)![0]);
+		const depth = agentIndex === 0 ? 0 : 1;
+		const raw = readFileSync(join(sessionDir, file), "utf-8");
+		const lines = raw.split("\n").filter((l) => l.trim());
+
+		let header: any = null;
+		let turnCount = 0;
+
+		for (const line of lines) {
+			let entry;
+			try {
+				entry = JSON.parse(line);
+			} catch {
+				continue;
+			}
+
+			if (entry.type === "session") {
+				header = entry;
+				// Emit session_start for agent-0 only
+				if (agentIndex === 0) {
+					events.push({
+						type: "session_start",
+						sessionId: basename(sessionDir),
+						ts: header.timestamp ? Math.floor(new Date(header.timestamp).getTime() / 1000) : 0,
+						...header.metadata,
+					});
+				}
+				// Emit agent_start
+				events.push({
+					type: "agent_start",
+					agentId: agentIndex,
+					depth,
+					label: agentIndex === 0 ? "Orchestrator" : "Sub-agent",
+					ts: header.timestamp ? Math.floor(new Date(header.timestamp).getTime() / 1000) : 0,
+				});
+				continue;
+			}
+
+			if (entry.type === "message") {
+				const msg = entry.message;
+				if (!msg) continue;
+
+				if (msg.role === "user") {
+					turnCount++;
+					if (turnCount > 1) {
+						events.push({ type: "turn_start", depth, ts: entry.ts });
+					}
+					// First user message on agent-0 includes system prompt in agent_start
+					if (turnCount === 1 && agentIndex === 0) {
+						// Retroactively add systemPrompt and userMessage to the agent_start event
+						const agentStart = events.find((e: any) => e.type === "agent_start" && e.agentId === agentIndex) as any;
+						if (agentStart) {
+							// Find system prompt from the agent state — it's not in the message log
+							// The user message content is in the message
+							const userContent = typeof msg.content === "string" ? msg.content : msg.content?.map((c: any) => c.text).join("\n") ?? "";
+							agentStart.userMessage = userContent;
+						}
+					} else if (turnCount === 1 && agentIndex > 0) {
+						const agentStart = events.find((e: any) => e.type === "agent_start" && e.agentId === agentIndex) as any;
+						if (agentStart) {
+							const userContent = typeof msg.content === "string" ? msg.content : msg.content?.map((c: any) => c.text).join("\n") ?? "";
+							agentStart.userMessage = userContent;
+						}
+					}
+					continue;
+				}
+
+				if (msg.role === "assistant") {
+					// Emit message_end with content blocks (renders thinking, text, and tool_use)
+					events.push({
+						type: "message_end",
+						agentId: agentIndex,
+						depth,
+						ts: entry.ts,
+						content: msg.content,
+						...(msg.usage ? {
+							usage: {
+								input: msg.usage.input,
+								output: msg.usage.output,
+								totalTokens: msg.usage.totalTokens,
+								cost: msg.usage.cost?.total,
+							},
+						} : {}),
+					});
+
+					// Also emit tool_execution_start for each tool_use block
+					// (the frontend renders these as EVAL code blocks)
+					if (Array.isArray(msg.content)) {
+						for (const block of msg.content) {
+							if (block.type === "tool_use" || block.type === "toolCall") {
+								const code = block.arguments?.code ?? block.input?.code ?? "";
+								if (code) {
+									events.push({
+										type: "tool_execution_start",
+										agentId: agentIndex,
+										depth,
+										ts: entry.ts,
+										toolName: block.name ?? "eval",
+										code,
+									});
+								}
+							}
+						}
+					}
+					continue;
+				}
+
+				if (msg.role === "toolResult") {
+					// Emit tool_execution_end for each tool result
+					events.push({
+						type: "tool_execution_end",
+						agentId: agentIndex,
+						depth,
+						ts: entry.ts,
+						result: { content: msg.content },
+					});
+					continue;
+				}
+			}
+
+			if (entry.type === "session_end") {
+				events.push({
+					type: "agent_end",
+					agentId: agentIndex,
+					depth,
+					ts: entry.ts,
+				});
+				if (agentIndex === 0) {
+					events.push({
+						type: "session_end",
+						ts: entry.ts,
+						usage: entry.usage,
+					});
+				}
+			}
+		}
+	}
+
+	return events;
+}
+
+function loadSession(id: string): object[] {
+	// Search across all domain dirs
+	for (const domain of listDomains(LOGS_ROOT)) {
+		// New format: session directory
+		const sessionDir = join(LOGS_ROOT, domain, id);
+		if (existsSync(sessionDir) && statSync(sessionDir).isDirectory()) {
+			const agent0 = join(sessionDir, "agent-0.jsonl");
+			if (existsSync(agent0)) {
+				return convertMessagesToEvents(sessionDir);
+			}
+		}
+
+		// Legacy format: flat JSONL file
+		const filePath = join(LOGS_ROOT, domain, `${id}.jsonl`);
+		if (!existsSync(filePath)) continue;
+
+		const raw = readFileSync(filePath, "utf-8");
+		const events: object[] = [];
+
+		for (const line of raw.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const evt = JSON.parse(line);
+				if (RENDERABLE_TYPES.has(evt.type)) {
+					events.push(evt);
+				}
+			} catch {
+				// skip
+			}
+		}
+
+		return events;
+	}
+
+	return [];
+}
+
+interface ResultFile {
+	filename: string;
+	domain: string;
+	config: Record<string, unknown>;
+	score: { correct: number; total: number; pct: number };
+	totals: { cost: number; tokens: number; timeMs: number };
+	results: Array<{
+		taskId: string;
+		correct: boolean;
+		failed?: boolean;
+		cost: number;
+		tokens: number;
+		timeMs: number;
+	}>;
+}
+
+function listResults(): ResultFile[] {
+	const results: ResultFile[] = [];
+
+	for (const domain of listDomains(RESULTS_ROOT)) {
+		const resultsDir = join(RESULTS_ROOT, domain);
+		const files = readdirSync(resultsDir).filter((f) => f.endsWith(".json")).sort().reverse();
+
+		for (const file of files) {
+			try {
+				const raw = readFileSync(join(resultsDir, file), "utf-8");
+				const data = JSON.parse(raw);
+				results.push({
+					filename: file,
+					domain,
+					config: data.config ?? {},
+					score: data.score ?? { correct: 0, total: 0, pct: 0 },
+					totals: data.totals ?? { cost: 0, tokens: 0, timeMs: 0 },
+					results: (data.results ?? []).map((r: Record<string, unknown>) => ({
+						taskId: r.taskId,
+						correct: r.correct,
+						failed: r.failed,
+						cost: r.cost,
+						tokens: r.tokens,
+						timeMs: r.timeMs,
+					})),
+				});
+			} catch {
+				// skip
+			}
+		}
+	}
+
+	return results;
+}
+
+// ── Server ──────────────────────────────────────────────────────────
+
+function jsonResponse(res: import("node:http").ServerResponse, data: unknown): void {
+	const body = JSON.stringify(data);
+	res.writeHead(200, {
+		"Content-Type": "application/json; charset=utf-8",
+		"Access-Control-Allow-Origin": "*",
+	});
+	res.end(body);
+}
+
+const server = createServer((req, res) => {
+	const url = new URL(req.url ?? "/", `http://localhost:${port}`);
+	const path = url.pathname;
+
+	if (path === "/api/sessions") {
+		jsonResponse(res, listSessions());
+		return;
+	}
+
+	if (path.startsWith("/api/session/")) {
+		const id = decodeURIComponent(path.slice("/api/session/".length));
+		jsonResponse(res, loadSession(id));
+		return;
+	}
+
+	if (path === "/api/active-sessions") {
+		jsonResponse(res, { sessionIds: fileWatcher ? [...fileWatcher.activeSessions()] : [] });
+		return;
+	}
+
+	if (path === "/api/results") {
+		jsonResponse(res, listResults());
+		return;
+	}
+
+	res.writeHead(404, { "Content-Type": "text/plain" });
+	res.end("Not found");
+});
+
+// ── FileWatcher — detects active sessions and streams new events ────
+
+const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
+
+class FileWatcher {
+	private active = new Map<string, { offset: number; watcher: FSWatcher; lastEventTs: number }>();
+	private dirWatchers: FSWatcher[] = [];
+	private wss: WebSocketServer;
+
+	constructor(wss: WebSocketServer) {
+		this.wss = wss;
+	}
+
+	/** Scan existing JSONL files across all domain dirs for active sessions. */
+	scanForActiveSessions(): void {
+		for (const domain of listDomains(LOGS_ROOT)) {
+			const logsDir = join(LOGS_ROOT, domain);
+			const entries = readdirSync(logsDir, { withFileTypes: true });
+
+			for (const entry of entries) {
+				// New format: session directories
+				if (entry.isDirectory()) {
+					const agent0Path = join(logsDir, entry.name, "agent-0.jsonl");
+					if (!existsSync(agent0Path)) continue;
+
+					try {
+						const raw = readFileSync(agent0Path, "utf-8");
+						const lines = raw.split("\n").filter((l) => l.trim());
+						if (lines.length === 0) continue;
+						const last = JSON.parse(lines[lines.length - 1]);
+						if (last.type === "session_end") continue;
+
+						const lastTs: number = last.ts ?? 0;
+						if ((Date.now() / 1000) - lastTs > STALE_THRESHOLD_MS / 1000) continue;
+
+						const sid = entry.name;
+						const stat = statSync(agent0Path);
+						this.watchFile(sid, agent0Path, stat.size, lastTs);
+					} catch {
+						// skip
+					}
+					continue;
+				}
+
+				// Legacy format: flat JSONL files
+				if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+					const filePath = join(logsDir, entry.name);
+					try {
+						const raw = readFileSync(filePath, "utf-8");
+						const lines = raw.split("\n").filter((l) => l.trim());
+						if (lines.length === 0) continue;
+						const last = JSON.parse(lines[lines.length - 1]);
+						if (last.type === "session_end") continue;
+
+						const lastTs: number = last.ts ?? 0;
+						if ((Date.now() / 1000) - lastTs > STALE_THRESHOLD_MS / 1000) continue;
+
+						const sid = basename(entry.name, ".jsonl");
+						const stat = statSync(filePath);
+						this.watchFile(sid, filePath, stat.size, lastTs);
+					} catch {
+						// skip
+					}
+				}
+			}
+		}
+	}
+
+	/** Periodically check for stale sessions that were killed without session_end. */
+	startStaleCheck(): void {
+		setInterval(() => {
+			const nowSec = Date.now() / 1000;
+			for (const [sid, entry] of this.active) {
+				const ageSec = nowSec - entry.lastEventTs;
+				if (ageSec * 1000 > STALE_THRESHOLD_MS) {
+					this.stopWatching(sid);
+					this.broadcast({ type: "session_ended", sessionId: sid });
+					console.log(`Session stale (no events for ${Math.round(ageSec)}s): ${sid}`);
+				}
+			}
+		}, 30_000);
+	}
+
+	/** Try to start watching a new session directory (new format). */
+	private tryWatchSessionDir(sid: string, sessionDir: string): void {
+		if (this.active.has(sid)) return;
+		const agent0Path = join(sessionDir, "agent-0.jsonl");
+		if (!existsSync(agent0Path)) return;
+
+		let firstTs = Date.now() / 1000;
+		try {
+			const head = readFileSync(agent0Path, "utf-8").split("\n")[0];
+			if (head) {
+				const parsed = JSON.parse(head);
+				firstTs = parsed.timestamp ? Math.floor(new Date(parsed.timestamp).getTime() / 1000) : firstTs;
+			}
+		} catch { /* use fallback */ }
+
+		this.watchFile(sid, agent0Path, 0, firstTs);
+		this.broadcast({ type: "session_active", sessionId: sid });
+	}
+
+	/** Start watching a domain log directory for new sessions. */
+	private watchDomainDir(logsDir: string): void {
+		const watcher = watch(logsDir, (eventType, filename) => {
+			if (!filename) return;
+			const fullPath = join(logsDir, filename);
+
+			// New format: directory with agent-0.jsonl
+			if (existsSync(fullPath) && statSync(fullPath).isDirectory()) {
+				// Watch inside the session dir for agent-0.jsonl appearing
+				const innerWatcher = watch(fullPath, (_, innerFile) => {
+					if (innerFile === "agent-0.jsonl") {
+						this.tryWatchSessionDir(filename, fullPath);
+					}
+				});
+				this.dirWatchers.push(innerWatcher);
+				// Also check immediately in case agent-0.jsonl already exists
+				this.tryWatchSessionDir(filename, fullPath);
+				return;
+			}
+
+			// Legacy format: flat JSONL files
+			if (!filename.endsWith(".jsonl")) return;
+			const sid = basename(filename, ".jsonl");
+			if (this.active.has(sid)) return;
+			if (!existsSync(fullPath)) return;
+
+			let firstTs = Date.now() / 1000;
+			try {
+				const head = readFileSync(fullPath, "utf-8").split("\n")[0];
+				if (head) firstTs = JSON.parse(head).ts ?? firstTs;
+			} catch { /* use fallback */ }
+
+			this.watchFile(sid, fullPath, 0, firstTs);
+			this.broadcast({ type: "session_active", sessionId: sid });
+		});
+		this.dirWatchers.push(watcher);
+	}
+
+	/** Watch all domain log directories for new JSONL files. */
+	watchDirectories(): void {
+		for (const domain of listDomains(LOGS_ROOT)) {
+			this.watchDomainDir(join(LOGS_ROOT, domain));
+		}
+
+		// Also watch LOGS_ROOT itself for new domain dirs appearing
+		if (existsSync(LOGS_ROOT)) {
+			const rootWatcher = watch(LOGS_ROOT, (eventType, filename) => {
+				if (!filename) return;
+				const newDir = join(LOGS_ROOT, filename);
+				if (existsSync(newDir) && statSync(newDir).isDirectory()) {
+					this.watchDomainDir(newDir);
+				}
+			});
+			this.dirWatchers.push(rootWatcher);
+		}
+	}
+
+	isActive(sessionId: string): boolean {
+		return this.active.has(sessionId);
+	}
+
+	activeSessions(): string[] {
+		return [...this.active.keys()];
+	}
+
+	private watchFile(sessionId: string, filePath: string, offset: number, lastEventTs: number): void {
+		const watcher = watch(filePath, () => {
+			this.readNewLines(sessionId, filePath);
+		});
+		this.active.set(sessionId, { offset, watcher, lastEventTs });
+		console.log(`Watching active session: ${sessionId}`);
+	}
+
+	private readNewLines(sessionId: string, filePath: string): void {
+		const entry = this.active.get(sessionId);
+		if (!entry) return;
+
+		let stat;
+		try {
+			stat = statSync(filePath);
+		} catch {
+			return;
+		}
+		if (stat.size <= entry.offset) return;
+
+		const bytesToRead = stat.size - entry.offset;
+		const buf = Buffer.alloc(bytesToRead);
+
+		let fd: number | undefined;
+		try {
+			fd = openSync(filePath, "r");
+			readSync(fd, buf, 0, bytesToRead, entry.offset);
+		} catch {
+			return;
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+		}
+
+		entry.offset = stat.size;
+
+		const chunk = buf.toString("utf-8");
+		const lines = chunk.split("\n").filter((l) => l.trim());
+
+		for (const line of lines) {
+			try {
+				const evt = JSON.parse(line);
+				if (evt.ts && entry) entry.lastEventTs = evt.ts;
+				if (RENDERABLE_TYPES.has(evt.type)) {
+					this.broadcast({ type: "event", sessionId, event: evt });
+				}
+				if (evt.type === "session_end") {
+					this.stopWatching(sessionId);
+					this.broadcast({ type: "session_ended", sessionId });
+				}
+			} catch {
+				// skip malformed lines
+			}
+		}
+	}
+
+	private stopWatching(sessionId: string): void {
+		const entry = this.active.get(sessionId);
+		if (!entry) return;
+		entry.watcher.close();
+		this.active.delete(sessionId);
+		console.log(`Session ended: ${sessionId}`);
+	}
+
+	private broadcast(data: unknown): void {
+		const msg = JSON.stringify(data);
+		for (const client of this.wss.clients) {
+			if (client.readyState === 1 /* WebSocket.OPEN */) {
+				client.send(msg);
+			}
+		}
+	}
+}
+
+// ── WebSocket server ────────────────────────────────────────────────
+
+const wss = new WebSocketServer({ noServer: true });
+
+let fileWatcher: FileWatcher | null = null;
+
+wss.on("connection", (ws: WebSocket) => {
+	if (fileWatcher) {
+		ws.send(JSON.stringify({
+			type: "active_sessions",
+			sessionIds: fileWatcher.activeSessions(),
+		}));
+	}
+});
+
+server.on("upgrade", (req, socket, head) => {
+	const url = new URL(req.url ?? "/", `http://localhost:${port}`);
+	if (url.pathname === "/ws") {
+		wss.handleUpgrade(req, socket, head, (ws) => {
+			wss.emit("connection", ws, req);
+		});
+	} else {
+		socket.destroy();
+	}
+});
+
+server.listen(port, () => {
+	console.log(`ARC Viewer API running on http://localhost:${port}`);
+	console.log(`  Scanning: ${LOGS_ROOT}/*/  and  ${RESULTS_ROOT}/*/`);
+	console.log(`  Domains: ${listDomains(LOGS_ROOT).join(", ") || "(none yet)"}`);
+
+	fileWatcher = new FileWatcher(wss);
+	fileWatcher.scanForActiveSessions();
+	fileWatcher.watchDirectories();
+	fileWatcher.startStaleCheck();
+});

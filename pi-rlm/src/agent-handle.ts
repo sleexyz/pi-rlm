@@ -3,6 +3,7 @@ import type { Model } from "@mariozechner/pi-ai";
 import { EvalRuntime } from "./eval-runtime.js";
 import { createEvalTool, type EvalToolOptions } from "./eval-tool.js";
 import { createTaggedOnEvent } from "./event-tagging.js";
+import type { AgentLogger } from "./agent-logger.js";
 
 export interface AgentHandleOptions {
 	evalToolOptions?: EvalToolOptions;
@@ -14,6 +15,8 @@ export interface AgentHandleOptions {
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	/** Custom stream function to override default streaming behavior (e.g. inject maxTokens). */
 	streamFn?: StreamFn;
+	/** Per-agent message logger. */
+	agentLogger?: AgentLogger;
 }
 
 /**
@@ -26,6 +29,7 @@ export class AgentHandle {
 	private resolved = false;
 	private resolvedValue: unknown = undefined;
 	private taggedOnEvent: ReturnType<typeof createTaggedOnEvent>;
+	private agentLogger?: AgentLogger;
 
 	constructor(
 		model: Model<any>,
@@ -85,6 +89,8 @@ export class AgentHandle {
 		if (this.taggedOnEvent.handler) {
 			this.agent.subscribe(this.taggedOnEvent.handler);
 		}
+
+		this.agentLogger = options.agentLogger;
 	}
 
 	/**
@@ -121,6 +127,11 @@ export class AgentHandle {
 		// Run the agent loop
 		await this.agent.prompt(message);
 
+		// Snapshot new messages for logging
+		if (this.agentLogger) {
+			this.agentLogger.snapshotMessages(this.agent.state.messages);
+		}
+
 		return this.resolvedValue as T | undefined;
 	}
 }
@@ -144,26 +155,34 @@ export interface SpawnAgentOptions {
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	/** Custom stream function to override default streaming behavior (e.g. inject maxTokens). */
 	streamFn?: StreamFn;
+	/** Domain-specific sub-agent prompt used when spawnAgent() is called with no args. */
+	defaultSubAgentPrompt?: string;
+	/** Domain reference appended to the auto-generated system prompt. */
+	domainReference?: string;
+	/** Session directory for per-agent logging. */
+	sessionDir?: import("./session-dir.js").SessionDir;
 }
 
 /**
  * Creates a `spawnAgent` function that can be injected into eval scopes.
- * The returned function creates AgentHandles with the given model and base scope.
- * The spawnAgent function itself is included in the scope, enabling recursive spawning.
+ *
+ * - `spawnAgent()` — auto-wraps with domain defaultSubAgentPrompt + DOMAIN_REFERENCE (smart default)
+ * - `spawnAgent("custom prompt")` — uses exactly what you pass (no auto-wrapping)
+ *
+ * Returns AgentHandle synchronously. The async work happens in `.call()`.
  */
 export function createSpawnAgent(
 	model: Model<any>,
 	thinkingLevel: ThinkingLevel,
 	baseScope: Record<string, unknown>,
 	options: SpawnAgentOptions = {},
-): (systemPrompt?: string) => Promise<AgentHandle> {
+): (systemPrompt?: string) => AgentHandle {
 	const maxDepth = options.maxDepth ?? 5;
 	const currentDepth = options.currentDepth ?? 0;
 	const { agentCounter } = options;
-
 	const eventDepth = options.eventDepth ?? 0;
 
-	const spawnAgent = async (systemPrompt?: string): Promise<AgentHandle> => {
+	const spawnAgent = (systemPrompt?: string): AgentHandle => {
 		if (currentDepth >= maxDepth) {
 			throw new Error(
 				`Maximum agent spawn depth (${maxDepth}) reached. Cannot spawn more nested agents.`,
@@ -180,23 +199,42 @@ export function createSpawnAgent(
 			agentCounter.count++;
 		}
 
-		// Create a child spawnAgent with incremented depth (same counter object shared)
+		// Auto-wrap: no args → domain defaultSubAgentPrompt + reference; custom string → use as-is
+		let effectivePrompt: string;
+		if (systemPrompt != null) {
+			effectivePrompt = systemPrompt;
+		} else if (options.defaultSubAgentPrompt) {
+			effectivePrompt = options.defaultSubAgentPrompt;
+			if (options.domainReference) {
+				effectivePrompt += `\n\n## Reference\n\n${options.domainReference}`;
+			}
+		} else {
+			effectivePrompt =
+				"You are a helpful sub-agent. Use the eval tool to execute code and accomplish your task. Call resolve(value) when done.";
+		}
+
+		// Create child spawnAgent with incremented depth (same counter object shared)
 		const childSpawnAgent = createSpawnAgent(model, thinkingLevel, baseScope, {
 			...options,
 			currentDepth: currentDepth + 1,
 			eventDepth: eventDepth + 1,
 		});
 
-		// Build scope for the new agent: base scope + spawnAgent itself
+		// Build scope for the new agent: base scope + spawnAgent
 		const scope: Record<string, unknown> = {
 			...baseScope,
 			spawnAgent: childSpawnAgent,
 		};
 
+		// Create per-agent logger if session dir is available
+		const agentLogger = options.sessionDir
+			? options.sessionDir.createAgentLogger({ role: "sub-agent", depth: currentDepth + 1 })
+			: undefined;
+
 		return new AgentHandle(
 			model,
 			thinkingLevel,
-			systemPrompt || "You are a helpful sub-agent. Use the eval tool to execute code and accomplish your task. Call resolve(value) when done.",
+			effectivePrompt,
 			scope,
 			{
 				evalToolOptions: options.evalToolOptions,
@@ -204,6 +242,7 @@ export function createSpawnAgent(
 				eventDepth,
 				getApiKey: options.getApiKey,
 				streamFn: options.streamFn,
+				agentLogger,
 			},
 		);
 	};

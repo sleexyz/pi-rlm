@@ -147,6 +147,39 @@ export class EvalRuntime {
 				durationMs: performance.now() - start,
 			};
 		} catch (err: unknown) {
+			// Bun's vm.Script doesn't always reject invalid syntax at compile
+			// time, so expression-mode wrapping can fail with SyntaxError at
+			// runtime. Since no code executes before a SyntaxError, it's safe
+			// to retry with statement-mode wrapping.
+			if ((err as Record<string, unknown>)?.name === "SyntaxError") {
+				const stmtWrapped = wrapAsStatements(code, persistCode);
+				if (stmtWrapped !== wrapped) {
+					try {
+						const script2 = new vm.Script(stmtWrapped, { filename: "eval" });
+						const promise2 = script2.runInContext(this.context) as Promise<unknown>;
+						const returnValue = await raceTimeout(promise2, timeoutMs);
+						return {
+							stdout: stdoutLines.join("\n"),
+							stderr: stderrLines.join("\n"),
+							returnValue,
+							error: null,
+							durationMs: performance.now() - start,
+						};
+					} catch (err2: unknown) {
+						// Statement mode also failed — report this error instead
+						const msg2 = err2 instanceof Error ? err2.message : String(err2);
+						const stack2 = err2 instanceof Error ? err2.stack : undefined;
+						return {
+							stdout: stdoutLines.join("\n"),
+							stderr: stderrLines.join("\n"),
+							returnValue: undefined,
+							error: stack2 || msg2,
+							durationMs: performance.now() - start,
+						};
+					}
+				}
+			}
+
 			const errorMessage = err instanceof Error ? err.message : String(err);
 			const errorStack = err instanceof Error ? err.stack : undefined;
 			return {
@@ -186,6 +219,16 @@ function scanDeclarations(code: string): string[] {
 	while ((declMatch = declRegex.exec(code)) !== null) {
 		// Skip declarations inside nested blocks (function bodies, etc.)
 		if (braceDepth[declMatch.index] > 0) continue;
+
+		// Skip let/const inside for-loop headers: `for (let i = ...)`
+		// These are block-scoped to the loop and can't be persisted.
+		const before = code.slice(0, declMatch.index).trimEnd();
+		if ((declMatch[1] === "let" || declMatch[1] === "const") && before.endsWith("(")) {
+			// Check if the open paren belongs to a `for` keyword
+			const parenIdx = before.length - 1;
+			const preSlice = code.slice(0, parenIdx).trimEnd();
+			if (/\bfor$/.test(preSlice)) continue;
+		}
 
 		let pos = declMatch.index + declMatch[0].length;
 		let expectIdent = true;
@@ -294,13 +337,22 @@ function wrapInAsyncIIFE(code: string, persistCode: string): string {
 	if (!trimmed) return `(async () => {${persistCode}})()`;
 
 	// Attempt 1: entire code is a single expression
-	// Skip if any line starts with a statement keyword (bun's vm.Script
-	// doesn't always reject invalid syntax at compile time)
-	const hasStatements = trimmed.split("\n").some((line) => STMT_KEYWORD_RE.test(line.trim()));
+	// Strip trailing semicolons — they're valid in statements but not
+	// inside the parenthesised expression wrapper, and Bun's vm.Script
+	// won't always reject the resulting invalid syntax at compile time.
+	const exprCode = trimmed.replace(/;+\s*$/, "");
+
+	// Skip expression attempt if any line starts with a statement keyword.
+	// This is a fast-path optimisation; the runtime SyntaxError retry in
+	// eval() is the real safety net for Bun's vm.Script which doesn't
+	// always reject invalid syntax at compile time.
+	const hasStatements = exprCode
+		.split("\n")
+		.some((line) => STMT_KEYWORD_RE.test(line.trim()));
 	if (!hasStatements) {
 		const exprWrapped = persistCode
-			? `(async () => { var __r = (\n${trimmed}\n);${persistCode}\n return __r; })()`
-			: `(async () => { return (\n${trimmed}\n); })()`;
+			? `(async () => { var __r = (\n${exprCode}\n);${persistCode}\n return __r; })()`
+			: `(async () => { return (\n${exprCode}\n); })()`;
 		try {
 			new vm.Script(exprWrapped);
 			return exprWrapped;
@@ -310,6 +362,14 @@ function wrapInAsyncIIFE(code: string, persistCode: string): string {
 	}
 
 	// Attempt 2: statements with implicit return on last expression.
+	return wrapAsStatements(code, persistCode);
+}
+
+/** Wrap code as statements (no expression attempt) with implicit return on last expression. */
+function wrapAsStatements(code: string, persistCode: string): string {
+	const trimmed = code.trim();
+	if (!trimmed) return `(async () => {${persistCode}})()`;
+
 	if (persistCode) {
 		// Use __retval assignment (not return) so persistCode runs before exit.
 		const withImplicit = addImplicitReturn(trimmed, "__retval");

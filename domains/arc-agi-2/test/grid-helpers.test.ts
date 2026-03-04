@@ -21,7 +21,7 @@ import {
 	connectedComponents,
 	accuracy,
 	softAccuracy,
-} from "../../src/arc/grid-helpers.js";
+} from "../src/grid-helpers.js";
 
 // ── Rendering ──
 

@@ -13,8 +13,8 @@ export { AgentHandle, createSpawnAgent, type AgentHandleOptions, type SpawnAgent
 // Memories
 export { Memories, MemoryQueryError, type MemoriesOptions } from "./memories.js";
 
-// Domain adapter
-export type { DomainAdapter } from "./domain-adapter.js";
+// Adapter
+export type { Adapter } from "./domain-adapter.js";
 
 // System prompt
 export { generateSystemPrompt } from "./system-prompt.js";
@@ -40,35 +40,9 @@ export { createBudgetedAction, type BudgetedAction, type BudgetedActionOptions }
 // Action history
 export { ActionHistory, createTrackedAction, type HistoryEntry } from "./action-history.js";
 
-// Session logging
+// Session logging (legacy event-stream)
 export { SessionLogger, type SessionLoggerOptions } from "./session-logger.js";
 
-// ARC-AGI-2
-export type { ArcGrid, ArcExample, ArcTask, ArcAttempt, ArcResult } from "./arc/types.js";
-export { createArcAdapter } from "./arc/adapter.js";
-export { loadTask, loadTasksFromDir, selectDevSet } from "./arc/task-loader.js";
-export {
-	renderGrid,
-	gridShape,
-	makeGrid,
-	copyGrid,
-	gridsEqual,
-	rotate90,
-	rotate180,
-	rotate270,
-	flipH,
-	flipV,
-	transpose,
-	crop,
-	paste,
-	tile,
-	findColor,
-	colorCounts,
-	replaceColor,
-	uniqueColors,
-	connectedComponents,
-	accuracy,
-	softAccuracy,
-	type Component,
-	type ConnectedComponentsOptions,
-} from "./arc/grid-helpers.js";
+// Per-agent message logging
+export { AgentLogger, type AgentLoggerOptions } from "./agent-logger.js";
+export { SessionDir, type SessionDirOptions } from "./session-dir.js";

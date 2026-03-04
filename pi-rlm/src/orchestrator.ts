@@ -1,15 +1,14 @@
 import { Agent, type AgentEvent, type StreamFn, type ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, Model } from "@mariozechner/pi-ai";
-import type { DomainAdapter } from "./domain-adapter.js";
+import type { Adapter } from "./domain-adapter.js";
 import { EvalRuntime } from "./eval-runtime.js";
 import { createEvalTool, type EvalToolOptions } from "./eval-tool.js";
 import { createSpawnAgent } from "./agent-handle.js";
-import { Memories } from "./memories.js";
 import { generateSystemPrompt } from "./system-prompt.js";
 import { createTaggedOnEvent, type TaggedAgentEvent } from "./event-tagging.js";
 import { UsageTracker } from "./usage-tracker.js";
-import { ActionHistory, createTrackedAction } from "./action-history.js";
-import { createBudgetedAction } from "./budgeted-action.js";
+import type { SessionDir } from "./session-dir.js";
+import type { AgentLogger } from "./agent-logger.js";
 
 export interface OrchestratorOptions {
 	/** Model for the main orchestrator agent. */
@@ -20,8 +19,8 @@ export interface OrchestratorOptions {
 	thinkingLevel?: ThinkingLevel;
 	/** Thinking level for sub-agents. Defaults to thinkingLevel. */
 	subAgentThinkingLevel?: ThinkingLevel;
-	/** Domain adapter providing scope, prompts, and reference. */
-	adapter: DomainAdapter;
+	/** Adapter providing scope, prompts, and reference. */
+	adapter: Adapter;
 	/** Maximum eval output characters. Default: 20000 */
 	maxOutputChars?: number;
 	/** Maximum agent spawn depth. Default: 5 */
@@ -34,29 +33,29 @@ export interface OrchestratorOptions {
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	/** Custom stream function to override default streaming behavior (e.g. inject maxTokens). */
 	streamFn?: StreamFn;
+	/** Session directory for per-agent message logging. */
+	sessionDir?: SessionDir;
 }
 
 /**
- * Main orchestrator that ties everything together.
+ * Thin shell that wires an Adapter into an eval-loop agent.
  *
- * Creates an eval runtime with full scope (spawnAgent, memories, domain objects),
- * wraps it as the single eval tool on a pi-mono Agent, and runs the agent loop.
+ * Takes domain.scope, adds spawnAgent + resolve/reject + DOMAIN_REFERENCE,
+ * assembles the system prompt from domain fields, and runs the agent loop.
  */
 export class Orchestrator {
 	private agent: Agent;
 	private runtime: EvalRuntime;
-	private memories: Memories;
-	private adapter: DomainAdapter;
+	private adapter: Adapter;
 	private resolved = false;
 	private resolvedValue: unknown = undefined;
 	private rejected = false;
 	private rejectionReason: string | undefined = undefined;
-	private options: OrchestratorOptions;
 	private taggedOnEvent: ReturnType<typeof createTaggedOnEvent>;
 	private usageTracker: UsageTracker;
+	private agentLogger?: AgentLogger;
 
 	constructor(options: OrchestratorOptions) {
-		this.options = options;
 		this.adapter = options.adapter;
 		this.usageTracker = new UsageTracker();
 
@@ -64,14 +63,12 @@ export class Orchestrator {
 		const subAgentModel = options.subAgentModel ?? options.model;
 		const subAgentThinkingLevel = options.subAgentThinkingLevel ?? thinkingLevel;
 
-		// Generate system prompt early so we can attach it to tagged events
-		const systemPrompt = this.adapter.generateSystemPrompt?.() ?? generateSystemPrompt(this.adapter);
+		// Assemble system prompt from domain fields
+		const systemPrompt = generateSystemPrompt(this.adapter);
 
-		// Wrap onEvent with depth=0 metadata for the orchestrator.
-		// Also intercept tagged events for usage tracking.
+		// Wrap onEvent with depth=0 metadata + usage tracking
 		const wrappedOnEvent = options.onEvent
 			? (event: AgentEvent) => {
-					// Track usage from tagged message_end events
 					if (event.type === "message_end") {
 						const taggedEvent = event as TaggedAgentEvent;
 						const msg = event.message as AssistantMessage;
@@ -90,36 +87,16 @@ export class Orchestrator {
 		});
 		this.taggedOnEvent = tagged;
 
-		// Create shared memories (wrappedOnEvent so memory agents also track usage)
-		this.memories = new Memories(subAgentModel, subAgentThinkingLevel, {
-			onEvent: wrappedOnEvent,
-			getApiKey: options.getApiKey,
-		});
-
-		// Get domain scope
-		const domainScope = this.adapter.getScope();
-
-		// Action history — wrap domain actions if actionNames specified
-		const actionHistory = new ActionHistory();
-		const trackedScope: Record<string, unknown> = { ...domainScope };
-		if (this.adapter.actionNames) {
-			for (const name of this.adapter.actionNames) {
-				if (typeof trackedScope[name] === "function") {
-					trackedScope[name] = createTrackedAction(
-						trackedScope[name] as (...args: any[]) => any,
-						name,
-						actionHistory,
-					);
-				}
-			}
-		}
-
-		// Build base scope for sub-agents (without spawnAgent — that's added by createSpawnAgent)
+		// Base scope = domain scope + DOMAIN_REFERENCE
 		const baseScope: Record<string, unknown> = {
-			...trackedScope,
-			memories: this.memories,
+			...this.adapter.scope,
 			DOMAIN_REFERENCE: this.adapter.reference,
 		};
+
+		// Create root agent logger if sessionDir provided
+		if (options.sessionDir) {
+			this.agentLogger = options.sessionDir.createAgentLogger({ role: "root" });
+		}
 
 		// Create spawnAgent factory
 		const agentCounter = options.maxAgents != null ? { count: 0 } : undefined;
@@ -129,22 +106,23 @@ export class Orchestrator {
 			agentCounter,
 			evalToolOptions: {
 				maxOutputChars: options.maxOutputChars,
-				onResult: this.adapter.getStatus
-					? () => this.adapter.getStatus!()
+				onResult: this.adapter.onEvalResult
+					? () => this.adapter.onEvalResult!()
 					: undefined,
 			},
 			onEvent: wrappedOnEvent,
 			eventDepth: 1,
 			getApiKey: options.getApiKey,
 			streamFn: options.streamFn,
+			defaultSubAgentPrompt: this.adapter.defaultSubAgentPrompt,
+			domainReference: this.adapter.reference,
+			sessionDir: options.sessionDir,
 		});
 
-		// Build the full orchestrator scope
-		const orchestratorScope: Record<string, unknown> = {
+		// Full scope: domain + framework primitives
+		const fullScope: Record<string, unknown> = {
 			...baseScope,
-			spawnAgent: spawnAgent,
-			createBudgetedAction,
-			history: actionHistory,
+			spawnAgent,
 			resolve: (value: unknown) => {
 				if (this.resolved || this.rejected) return;
 				this.resolved = true;
@@ -157,22 +135,19 @@ export class Orchestrator {
 			},
 		};
 
-		// Create eval runtime
-		this.runtime = new EvalRuntime(orchestratorScope);
+		// Create eval runtime + tool
+		this.runtime = new EvalRuntime(fullScope);
 
-		// Build eval tool options
 		const evalToolOptions: EvalToolOptions = {
 			maxOutputChars: options.maxOutputChars,
-			onResult: (result) => {
+			onResult: () => {
 				const parts: string[] = [];
 
-				// Domain status
-				if (this.adapter.getStatus) {
-					const status = this.adapter.getStatus();
+				if (this.adapter.onEvalResult) {
+					const status = this.adapter.onEvalResult();
 					if (status) parts.push(status);
 				}
 
-				// resolve/reject notification
 				if (this.resolved) {
 					parts.push("Resolved. Do not make further eval calls.");
 				} else if (this.rejected) {
@@ -183,10 +158,9 @@ export class Orchestrator {
 			},
 		};
 
-		// Create the eval tool
 		const evalTool = createEvalTool(this.runtime, evalToolOptions);
 
-		// Create the orchestrator agent
+		// Create the agent
 		this.agent = new Agent({
 			initialState: {
 				systemPrompt,
@@ -211,18 +185,15 @@ export class Orchestrator {
 	 * @returns The resolved value, or undefined if rejected/not resolved
 	 */
 	async run(task: string, initialObjects?: Record<string, unknown>): Promise<unknown> {
-		// Inject initial objects if provided
 		if (initialObjects) {
 			this.runtime.injectScope(initialObjects);
 		}
 
-		// Reset resolve/reject state
 		this.resolved = false;
 		this.resolvedValue = undefined;
 		this.rejected = false;
 		this.rejectionReason = undefined;
 
-		// Build the user message
 		let message = task;
 		if (initialObjects) {
 			const names = Object.keys(initialObjects);
@@ -231,11 +202,13 @@ export class Orchestrator {
 			}
 		}
 
-		// Set user message on tagged event wrapper so agent_start includes it
 		this.taggedOnEvent.setUserMessage(message);
-
-		// Run the agent loop
 		await this.agent.prompt(message);
+
+		// Snapshot new messages for logging
+		if (this.agentLogger) {
+			this.agentLogger.snapshotMessages(this.agent.state.messages);
+		}
 
 		if (this.rejected) {
 			throw new Error(`Agent rejected: ${this.rejectionReason}`);
@@ -249,11 +222,6 @@ export class Orchestrator {
 		return this.agent;
 	}
 
-	/** Get the shared memories database. */
-	getMemories(): Memories {
-		return this.memories;
-	}
-
 	/** Get the eval runtime for direct scope inspection. */
 	getRuntime(): EvalRuntime {
 		return this.runtime;
@@ -262,5 +230,10 @@ export class Orchestrator {
 	/** Get the usage tracker for token/cost reporting. */
 	getUsageTracker(): UsageTracker {
 		return this.usageTracker;
+	}
+
+	/** Get the root agent logger (if session logging is enabled). */
+	getAgentLogger(): AgentLogger | undefined {
+		return this.agentLogger;
 	}
 }

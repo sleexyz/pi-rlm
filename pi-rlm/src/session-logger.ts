@@ -68,9 +68,20 @@ export class SessionLogger {
 				break;
 
 			case "message_start":
-			case "message_update":
 				this.writeLine(base);
 				break;
+
+			case "message_update": {
+				const ame = (event as any).assistantMessageEvent;
+				if (ame && (ame.type === "text_delta" || ame.type === "thinking_delta")) {
+					this.writeLine({
+						...base,
+						deltaType: ame.type,
+						delta: ame.delta,
+					});
+				}
+				break;
+			}
 
 			case "message_end": {
 				const msg = event.message as AssistantMessage;

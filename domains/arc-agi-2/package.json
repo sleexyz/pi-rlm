@@ -1,0 +1,21 @@
+{
+	"name": "eval-arc-agi-2",
+	"version": "0.1.0",
+	"description": "ARC-AGI-2 evaluation harness for pi-rlm",
+	"type": "module",
+	"dependencies": {
+		"pi-rlm": "workspace:*",
+		"@mariozechner/pi-agent-core": "^0.55.1",
+		"@mariozechner/pi-ai": "^0.55.1",
+		"@mariozechner/pi-tui": "^0.55.3",
+		"chalk": "^5.6.2",
+		"ws": "^8.19.0"
+	},
+	"devDependencies": {
+		"@types/node": "^24.3.0",
+		"@types/ws": "^8.18.1",
+		"typescript": "^5.7.3",
+		"vite": "^7.3.1",
+		"vitest": "^3.2.4"
+	}
+}

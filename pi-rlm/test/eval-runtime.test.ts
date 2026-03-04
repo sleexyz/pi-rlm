@@ -126,6 +126,29 @@ describe("EvalRuntime", () => {
 		expect(result.error).toContain("after");
 	});
 
+	it("handles expressions with trailing semicolons", async () => {
+		const rt = new EvalRuntime();
+		const result = await rt.eval('console.log("Hello, World!");');
+		expect(result.error).toBeNull();
+		expect(result.stdout).toBe("Hello, World!");
+	});
+
+	it("handles multi-line statements with comments containing apostrophes", async () => {
+		const rt = new EvalRuntime({
+			renderGrid: (g: number[][]) => g.map((r) => r.join(" ")).join("\n"),
+			gridShape: (g: number[][]) => `${g.length}x${g[0].length}`,
+			testInputs: [[[1, 2], [3, 4]]],
+		});
+		const result = await rt.eval(`// Let's look at the test input too
+console.log("Test Input:");
+console.log(renderGrid(testInputs[0]));
+console.log(\`Test input shape: \${gridShape(testInputs[0])}\`);`);
+		expect(result.error).toBeNull();
+		expect(result.stdout).toContain("Test Input:");
+		expect(result.stdout).toContain("1 2\n3 4");
+		expect(result.stdout).toContain("2x2");
+	});
+
 	it("has access to standard globals", async () => {
 		const rt = new EvalRuntime();
 		const result = await rt.eval("JSON.stringify({ a: 1 })");
