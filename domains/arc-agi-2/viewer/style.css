@@ -97,31 +97,135 @@ header h1 {
   padding: 8px 0;
 }
 
-.session-item {
+/* Run groups */
+.run-group {
+  border-bottom: 1px solid var(--border);
+}
+
+.run-group.run-active {
+  border-left: 2px solid var(--cyan);
+}
+
+.run-header {
   padding: 8px 12px;
   cursor: pointer;
-  border-left: 3px solid transparent;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   transition: background 0.1s;
 }
 
-.session-item:hover {
+.run-header:hover {
   background: rgba(255,255,255,0.05);
 }
 
-.session-item.active {
-  background: rgba(233, 69, 96, 0.15);
-  border-left-color: var(--accent);
+.run-arrow {
+  font-size: 10px;
+  color: var(--fg-dim);
+  width: 12px;
+  flex-shrink: 0;
 }
 
-.session-item .task-id {
+.run-name {
   font-weight: 600;
   color: var(--fg);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.session-item .meta {
+.run-score {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--green);
+  flex-shrink: 0;
+}
+
+.run-cost {
   font-size: 11px;
   color: var(--fg-dim);
-  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.run-desc {
+  padding: 0 12px 4px 30px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+.run-config {
+  padding: 0 12px 6px 30px;
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+.run-tasks {
+  padding-bottom: 4px;
+}
+
+.task-row {
+  padding: 4px 12px 4px 30px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.1s;
+}
+
+.task-row:hover {
+  background: rgba(255,255,255,0.05);
+}
+
+.task-row.active {
+  background: rgba(233, 69, 96, 0.15);
+}
+
+.task-arrow {
+  font-size: 9px;
+  color: var(--fg-dim);
+  width: 10px;
+  flex-shrink: 0;
+}
+
+.task-row .task-id {
+  font-weight: 500;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.task-meta {
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.attempt-row {
+  padding: 3px 12px 3px 48px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  transition: background 0.1s;
+}
+
+.attempt-row:hover {
+  background: rgba(255,255,255,0.05);
+}
+
+.attempt-row.active {
+  background: rgba(233, 69, 96, 0.15);
+}
+
+.attempt-label {
+  color: var(--fg-dim);
+  font-size: 10px;
+  width: 16px;
+  flex-shrink: 0;
 }
 
 .badge {
@@ -136,6 +240,10 @@ header h1 {
 .badge.ok   { background: rgba(74,222,128,0.2); color: var(--green); }
 .badge.err  { background: rgba(248,113,113,0.2); color: var(--red); }
 .badge.fail { background: rgba(251,191,36,0.2); color: var(--yellow); }
+.badge.pending {
+  background: rgba(136, 136, 136, 0.2);
+  color: var(--fg-dim);
+}
 .badge.live {
   background: rgba(34, 211, 238, 0.2);
   color: var(--cyan);
@@ -146,27 +254,6 @@ header h1 {
   50% { opacity: 0.5; }
 }
 
-.domain-header {
-  padding: 6px 12px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--fg-dim);
-  border-bottom: 1px solid var(--border);
-  margin-top: 4px;
-}
-
-.domain-tag {
-  display: inline-block;
-  padding: 0 5px;
-  border-radius: 3px;
-  font-size: 10px;
-  font-weight: 600;
-  margin-left: 6px;
-  background: rgba(96, 165, 250, 0.15);
-  color: var(--blue);
-}
 
 /* Trace view */
 #trace {

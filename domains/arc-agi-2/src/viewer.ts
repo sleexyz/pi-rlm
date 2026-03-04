@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 /**
- * ARC Trace Viewer — API server for session logs and results.
+ * ARC Trace Viewer — API server for run data and session traces.
  *
  * Usage: bun domains/arc-agi-2/src/viewer.ts [--port <n>]
  *
- * Scans logs/<domain>/ and results/<domain>/ at the repo root for all domains.
- * Serves JSON APIs consumed by the Vite frontend in domains/arc-agi-2/viewer/.
+ * Scans runs/ at the repo root for run directories containing run.json.
+ * Serves JSON APIs consumed by the frontend in domains/arc-agi-2/viewer/.
  */
 
 import { readdirSync, readFileSync, existsSync, watch, openSync, readSync, closeSync, statSync, mkdirSync, type FSWatcher } from "node:fs";
@@ -21,160 +21,35 @@ const port = portIdx !== -1 && args[portIdx + 1]
 	? parseInt(args[portIdx + 1], 10)
 	: process.env.PORT ? parseInt(process.env.PORT, 10) : 3334;
 
-// Resolve relative to repo root — scan all subdirs of logs/ and results/
 const repoRoot = join(import.meta.dirname, "../../..");
-const LOGS_ROOT = join(repoRoot, "logs");
-const RESULTS_ROOT = join(repoRoot, "results");
-
-/** List subdirectories of a root dir (each subdir is a domain). */
-function listDomains(root: string): string[] {
-	if (!existsSync(root)) return [];
-	return readdirSync(root, { withFileTypes: true })
-		.filter((d) => d.isDirectory())
-		.map((d) => d.name)
-		.sort();
-}
+const RUNS_ROOT = join(repoRoot, "runs");
 
 // ── Data helpers ────────────────────────────────────────────────────
 
-interface SessionSummary {
-	sessionId: string;
-	filename: string;
-	domain: string;
-	ts: number;
-	taskId?: string;
-	split?: string;
-	model?: string;
-	turns: number;
-	usage?: { totalTokens: number; totalCost: number };
-	active?: boolean;
-}
-
-function loadAnnotations(logsDir: string): Record<string, { model?: string; taskId?: string }> {
-	const annoPath = join(logsDir, "annotations.json");
-	if (!existsSync(annoPath)) return {};
-	try {
-		const data = JSON.parse(readFileSync(annoPath, "utf-8"));
-		return data.sessions ?? {};
-	} catch {
-		return {};
-	}
-}
-
-function listSessions(): SessionSummary[] {
-	const summaries: SessionSummary[] = [];
-
-	for (const domain of listDomains(LOGS_ROOT)) {
-		const logsDir = join(LOGS_ROOT, domain);
-		const annotations = loadAnnotations(logsDir);
-
-		// New format: session directories containing agent-*.jsonl files
-		const entries = readdirSync(logsDir, { withFileTypes: true });
-		for (const entry of entries) {
-			if (entry.isDirectory()) {
-				const sessionDir = join(logsDir, entry.name);
-				const agent0Path = join(sessionDir, "agent-0.jsonl");
-				if (!existsSync(agent0Path)) continue;
-
-				try {
-					const raw = readFileSync(agent0Path, "utf-8");
-					const lines = raw.split("\n").filter((l) => l.trim());
-					if (lines.length === 0) continue;
-
-					const header = JSON.parse(lines[0]);
-					const last = JSON.parse(lines[lines.length - 1]);
-					const meta = header.metadata ?? {};
-
-					// Count turns: each "user" role message = one turn
-					let turns = 0;
-					for (const line of lines) {
-						try {
-							const entry = JSON.parse(line);
-							if (entry.type === "message" && entry.message?.role === "user") turns++;
-						} catch { /* skip */ }
-					}
-
-					const sid = entry.name;
-					const anno = annotations[sid];
-					const summary: SessionSummary = {
-						sessionId: sid,
-						filename: entry.name,
-						domain,
-						ts: header.timestamp ? Math.floor(new Date(header.timestamp).getTime() / 1000) : 0,
-						taskId: meta.taskId ?? anno?.taskId,
-						split: meta.split,
-						model: meta.model ?? anno?.model,
-						turns,
-					};
-
-					if (last.type === "session_end" && last.usage) {
-						summary.usage = {
-							totalTokens: last.usage.totalTokens ?? 0,
-							totalCost: last.usage.totalCost ?? 0,
-						};
-					}
-
-					if (fileWatcher?.isActive(sid)) {
-						summary.active = true;
-					}
-
-					summaries.push(summary);
-				} catch {
-					// skip malformed
-				}
-				continue;
-			}
-
-			// Legacy format: flat JSONL files
-			if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-				try {
-					const raw = readFileSync(join(logsDir, entry.name), "utf-8");
-					const lines = raw.split("\n").filter((l) => l.trim());
-					if (lines.length === 0) continue;
-
-					const first = JSON.parse(lines[0]);
-					const last = JSON.parse(lines[lines.length - 1]);
-
-					let turns = 0;
-					for (const line of lines) {
-						if (line.includes('"turn_start"')) turns++;
-					}
-
-					const sid = first.sessionId ?? basename(entry.name, ".jsonl");
-					const anno = annotations[sid];
-					const summary: SessionSummary = {
-						sessionId: sid,
-						filename: entry.name,
-						domain,
-						ts: first.ts ?? 0,
-						taskId: first.taskId ?? anno?.taskId,
-						split: first.split,
-						model: first.model ?? anno?.model,
-						turns,
-					};
-
-					if (last.type === "session_end" && last.usage) {
-						summary.usage = {
-							totalTokens: last.usage.totalTokens ?? 0,
-							totalCost: last.usage.totalCost ?? 0,
-						};
-					}
-
-					if (fileWatcher?.isActive(sid)) {
-						summary.active = true;
-					}
-
-					summaries.push(summary);
-				} catch {
-					// skip malformed files
-				}
-			}
+function listRuns(): object[] {
+	if (!existsSync(RUNS_ROOT)) return [];
+	const runs: any[] = [];
+	const entries = readdirSync(RUNS_ROOT, { withFileTypes: true });
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const runJsonPath = join(RUNS_ROOT, entry.name, "run.json");
+		if (!existsSync(runJsonPath)) continue;
+		try {
+			const data = JSON.parse(readFileSync(runJsonPath, "utf-8"));
+			// Annotate with active session info
+			data._activeSessions = fileWatcher?.activeSessionsInRun(data.name) ?? [];
+			runs.push(data);
+		} catch {
+			// skip malformed
 		}
 	}
-
-	// Sort all sessions by timestamp descending
-	summaries.sort((a, b) => b.ts - a.ts);
-	return summaries;
+	// Sort by startedAt descending
+	runs.sort((a: any, b: any) => {
+		const ta = a.startedAt ? new Date(a.startedAt).getTime() : 0;
+		const tb = b.startedAt ? new Date(b.startedAt).getTime() : 0;
+		return tb - ta;
+	});
+	return runs;
 }
 
 const RENDERABLE_TYPES = new Set([
@@ -253,17 +128,8 @@ function convertMessagesToEvents(sessionDir: string): object[] {
 					if (turnCount > 1) {
 						events.push({ type: "turn_start", depth, ts: entry.ts });
 					}
-					// First user message on agent-0 includes system prompt in agent_start
-					if (turnCount === 1 && agentIndex === 0) {
-						// Retroactively add systemPrompt and userMessage to the agent_start event
-						const agentStart = events.find((e: any) => e.type === "agent_start" && e.agentId === agentIndex) as any;
-						if (agentStart) {
-							// Find system prompt from the agent state — it's not in the message log
-							// The user message content is in the message
-							const userContent = typeof msg.content === "string" ? msg.content : msg.content?.map((c: any) => c.text).join("\n") ?? "";
-							agentStart.userMessage = userContent;
-						}
-					} else if (turnCount === 1 && agentIndex > 0) {
+					// First user message — attach to agent_start
+					if (turnCount === 1) {
 						const agentStart = events.find((e: any) => e.type === "agent_start" && e.agentId === agentIndex) as any;
 						if (agentStart) {
 							const userContent = typeof msg.content === "string" ? msg.content : msg.content?.map((c: any) => c.text).join("\n") ?? "";
@@ -292,7 +158,6 @@ function convertMessagesToEvents(sessionDir: string): object[] {
 					});
 
 					// Also emit tool_execution_start for each tool_use block
-					// (the frontend renders these as EVAL code blocks)
 					if (Array.isArray(msg.content)) {
 						for (const block of msg.content) {
 							if (block.type === "tool_use" || block.type === "toolCall") {
@@ -314,7 +179,6 @@ function convertMessagesToEvents(sessionDir: string): object[] {
 				}
 
 				if (msg.role === "toolResult") {
-					// Emit tool_execution_end for each tool result
 					events.push({
 						type: "tool_execution_end",
 						agentId: agentIndex,
@@ -347,92 +211,43 @@ function convertMessagesToEvents(sessionDir: string): object[] {
 	return events;
 }
 
+/**
+ * Load a session trace by ID.
+ * ID format: "<runName>/<sessionDirName>" e.g. "stellar-meadow/007bbfb7_a0"
+ * Falls back to searching all runs if no "/" in the ID.
+ */
 function loadSession(id: string): object[] {
-	// Search across all domain dirs
-	for (const domain of listDomains(LOGS_ROOT)) {
-		// New format: session directory
-		const sessionDir = join(LOGS_ROOT, domain, id);
+	// Composite ID: runName/sessionDirName
+	const slashIdx = id.indexOf("/");
+	if (slashIdx !== -1) {
+		const runName = id.substring(0, slashIdx);
+		const sessionDirName = id.substring(slashIdx + 1);
+		const sessionDir = join(RUNS_ROOT, runName, "sessions", sessionDirName);
 		if (existsSync(sessionDir) && statSync(sessionDir).isDirectory()) {
 			const agent0 = join(sessionDir, "agent-0.jsonl");
 			if (existsSync(agent0)) {
 				return convertMessagesToEvents(sessionDir);
 			}
 		}
+	}
 
-		// Legacy format: flat JSONL file
-		const filePath = join(LOGS_ROOT, domain, `${id}.jsonl`);
-		if (!existsSync(filePath)) continue;
-
-		const raw = readFileSync(filePath, "utf-8");
-		const events: object[] = [];
-
-		for (const line of raw.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const evt = JSON.parse(line);
-				if (RENDERABLE_TYPES.has(evt.type)) {
-					events.push(evt);
+	// Fallback: search all runs for a matching session dir name
+	if (existsSync(RUNS_ROOT)) {
+		for (const runEntry of readdirSync(RUNS_ROOT, { withFileTypes: true })) {
+			if (!runEntry.isDirectory()) continue;
+			const sessionsDir = join(RUNS_ROOT, runEntry.name, "sessions");
+			if (!existsSync(sessionsDir)) continue;
+			const sessionDir = join(sessionsDir, id);
+			if (existsSync(sessionDir) && statSync(sessionDir).isDirectory()) {
+				const agent0 = join(sessionDir, "agent-0.jsonl");
+				if (existsSync(agent0)) {
+					return convertMessagesToEvents(sessionDir);
 				}
-			} catch {
-				// skip
 			}
 		}
-
-		return events;
 	}
 
 	return [];
-}
-
-interface ResultFile {
-	filename: string;
-	domain: string;
-	config: Record<string, unknown>;
-	score: { correct: number; total: number; pct: number };
-	totals: { cost: number; tokens: number; timeMs: number };
-	results: Array<{
-		taskId: string;
-		correct: boolean;
-		failed?: boolean;
-		cost: number;
-		tokens: number;
-		timeMs: number;
-	}>;
-}
-
-function listResults(): ResultFile[] {
-	const results: ResultFile[] = [];
-
-	for (const domain of listDomains(RESULTS_ROOT)) {
-		const resultsDir = join(RESULTS_ROOT, domain);
-		const files = readdirSync(resultsDir).filter((f) => f.endsWith(".json")).sort().reverse();
-
-		for (const file of files) {
-			try {
-				const raw = readFileSync(join(resultsDir, file), "utf-8");
-				const data = JSON.parse(raw);
-				results.push({
-					filename: file,
-					domain,
-					config: data.config ?? {},
-					score: data.score ?? { correct: 0, total: 0, pct: 0 },
-					totals: data.totals ?? { cost: 0, tokens: 0, timeMs: 0 },
-					results: (data.results ?? []).map((r: Record<string, unknown>) => ({
-						taskId: r.taskId,
-						correct: r.correct,
-						failed: r.failed,
-						cost: r.cost,
-						tokens: r.tokens,
-						timeMs: r.timeMs,
-					})),
-				});
-			} catch {
-				// skip
-			}
-		}
-	}
-
-	return results;
 }
 
 // ── Server ──────────────────────────────────────────────────────────
@@ -450,8 +265,8 @@ const server = createServer((req, res) => {
 	const url = new URL(req.url ?? "/", `http://localhost:${port}`);
 	const path = url.pathname;
 
-	if (path === "/api/sessions") {
-		jsonResponse(res, listSessions());
+	if (path === "/api/runs") {
+		jsonResponse(res, listRuns());
 		return;
 	}
 
@@ -462,20 +277,14 @@ const server = createServer((req, res) => {
 	}
 
 	if (path === "/api/active-sessions") {
-		jsonResponse(res, { sessionIds: fileWatcher ? [...fileWatcher.activeSessions()] : [] });
-		return;
-	}
-
-	if (path === "/api/results") {
-		jsonResponse(res, listResults());
+		jsonResponse(res, { sessionIds: fileWatcher ? fileWatcher.activeSessions() : [] });
 		return;
 	}
 
 	if (path === "/api/debug") {
 		jsonResponse(res, {
-			watcherActive: fileWatcher ? [...fileWatcher.activeSessions()] : [],
+			watcherActive: fileWatcher ? fileWatcher.activeSessions() : [],
 			wsClients: wss.clients.size,
-			watchedDomains: listDomains(LOGS_ROOT),
 		});
 		return;
 	}
@@ -500,8 +309,9 @@ interface AgentFileState {
 interface ActiveSession {
 	agentFiles: Map<string, AgentFileState>;
 	lastEventTs: number;
-	sessionDir: string | null; // null for legacy flat files
+	sessionDir: string;
 	dirWatcher: FSWatcher | null; // watches session dir for new agent-*.jsonl
+	runName: string;
 }
 
 class FileWatcher {
@@ -653,52 +463,33 @@ class FileWatcher {
 	// ── Session scanning ────────────────────────────────────────────
 
 	scanForActiveSessions(): void {
-		for (const domain of listDomains(LOGS_ROOT)) {
-			const logsDir = join(LOGS_ROOT, domain);
-			const entries = readdirSync(logsDir, { withFileTypes: true });
+		if (!existsSync(RUNS_ROOT)) return;
 
-			for (const entry of entries) {
-				if (entry.isDirectory()) {
-					const sessionDir = join(logsDir, entry.name);
-					const agent0Path = join(sessionDir, "agent-0.jsonl");
-					if (!existsSync(agent0Path)) continue;
+		for (const runEntry of readdirSync(RUNS_ROOT, { withFileTypes: true })) {
+			if (!runEntry.isDirectory()) continue;
+			const sessionsDir = join(RUNS_ROOT, runEntry.name, "sessions");
+			if (!existsSync(sessionsDir)) continue;
 
-					try {
-						const raw = readFileSync(agent0Path, "utf-8");
-						const lines = raw.split("\n").filter((l) => l.trim());
-						if (lines.length === 0) continue;
-						const last = JSON.parse(lines[lines.length - 1]);
-						if (last.type === "session_end") continue;
+			for (const sessionEntry of readdirSync(sessionsDir, { withFileTypes: true })) {
+				if (!sessionEntry.isDirectory()) continue;
+				const sessionDir = join(sessionsDir, sessionEntry.name);
+				const agent0Path = join(sessionDir, "agent-0.jsonl");
+				if (!existsSync(agent0Path)) continue;
 
-						const lastTs: number = last.ts ?? 0;
-						if ((Date.now() / 1000) - lastTs > STALE_THRESHOLD_MS / 1000) continue;
+				try {
+					const raw = readFileSync(agent0Path, "utf-8");
+					const lines = raw.split("\n").filter((l) => l.trim());
+					if (lines.length === 0) continue;
+					const last = JSON.parse(lines[lines.length - 1]);
+					if (last.type === "session_end") continue;
 
-						this.watchSessionDir(entry.name, sessionDir, true);
-					} catch {
-						// skip
-					}
-					continue;
-				}
+					const lastTs: number = last.ts ?? 0;
+					if ((Date.now() / 1000) - lastTs > STALE_THRESHOLD_MS / 1000) continue;
 
-				// Legacy format: flat JSONL files
-				if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-					const filePath = join(logsDir, entry.name);
-					try {
-						const raw = readFileSync(filePath, "utf-8");
-						const lines = raw.split("\n").filter((l) => l.trim());
-						if (lines.length === 0) continue;
-						const last = JSON.parse(lines[lines.length - 1]);
-						if (last.type === "session_end") continue;
-
-						const lastTs: number = last.ts ?? 0;
-						if ((Date.now() / 1000) - lastTs > STALE_THRESHOLD_MS / 1000) continue;
-
-						const sid = basename(entry.name, ".jsonl");
-						const stat = statSync(filePath);
-						this.watchLegacyFile(sid, filePath, stat.size, lastTs);
-					} catch {
-						// skip
-					}
+					const sid = `${runEntry.name}/${sessionEntry.name}`;
+					this.watchSessionDir(sid, sessionDir, runEntry.name, true);
+				} catch {
+					// skip
 				}
 			}
 		}
@@ -713,7 +504,7 @@ class FileWatcher {
 				const ageSec = nowSec - session.lastEventTs;
 				if (ageSec * 1000 > STALE_THRESHOLD_MS) {
 					this.stopWatching(sid);
-					this.broadcastControl({ type: "session_ended", sessionId: sid });
+					this.broadcastControl({ type: "session_ended", sessionId: sid, runName: session.runName });
 					console.log(`Session stale (no events for ${Math.round(ageSec)}s): ${sid}`);
 				}
 			}
@@ -733,7 +524,7 @@ class FileWatcher {
 	// ── Multi-agent session watching ────────────────────────────────
 
 	/** Watch a session directory for all agent-*.jsonl files */
-	private watchSessionDir(sid: string, sessionDir: string, resumeFromEnd = false): void {
+	private watchSessionDir(sid: string, sessionDir: string, runName: string, resumeFromEnd = false): void {
 		if (this.activeSessions_.has(sid)) return;
 		const agent0Path = join(sessionDir, "agent-0.jsonl");
 		if (!existsSync(agent0Path)) return;
@@ -752,6 +543,7 @@ class FileWatcher {
 			lastEventTs: firstTs,
 			sessionDir,
 			dirWatcher: null,
+			runName,
 		};
 		this.activeSessions_.set(sid, session);
 
@@ -835,77 +627,6 @@ class FileWatcher {
 				this.convertAndPush(sessionId, parsed, agentState);
 			} catch {
 				// skip malformed lines
-			}
-		}
-	}
-
-	/** Watch a legacy flat JSONL file */
-	private watchLegacyFile(sessionId: string, filePath: string, offset: number, lastEventTs: number): void {
-		if (this.activeSessions_.has(sessionId)) return;
-
-		const session: ActiveSession = {
-			agentFiles: new Map(),
-			lastEventTs,
-			sessionDir: null,
-			dirWatcher: null,
-		};
-		this.activeSessions_.set(sessionId, session);
-
-		const state: AgentFileState = {
-			offset,
-			pollTimer: setInterval(() => this.readNewLegacyLines(sessionId, filePath), POLL_INTERVAL_MS),
-			turnCount: 0,
-			agentIndex: -1, // legacy marker
-		};
-		session.agentFiles.set(filePath, state);
-		console.log(`Watching active session (legacy): ${sessionId}`);
-	}
-
-	/** Read new lines from a legacy flat JSONL file */
-	private readNewLegacyLines(sessionId: string, filePath: string): void {
-		const session = this.activeSessions_.get(sessionId);
-		if (!session) return;
-		const state = session.agentFiles.get(filePath);
-		if (!state) return;
-
-		let stat;
-		try {
-			stat = statSync(filePath);
-		} catch {
-			return;
-		}
-		if (stat.size <= state.offset) return;
-
-		const bytesToRead = stat.size - state.offset;
-		const buf = Buffer.alloc(bytesToRead);
-		let fd: number | undefined;
-		try {
-			fd = openSync(filePath, "r");
-			readSync(fd, buf, 0, bytesToRead, state.offset);
-		} catch {
-			return;
-		} finally {
-			if (fd !== undefined) closeSync(fd);
-		}
-		state.offset = stat.size;
-
-		const chunk = buf.toString("utf-8");
-		const lines = chunk.split("\n").filter((l) => l.trim());
-
-		for (const line of lines) {
-			try {
-				const parsed = JSON.parse(line);
-				if (parsed.ts) session.lastEventTs = parsed.ts;
-
-				if (RENDERABLE_TYPES.has(parsed.type)) {
-					this.pushEvent(sessionId, { type: "event", sessionId, event: parsed });
-				}
-				if (parsed.type === "session_end") {
-					this.stopWatching(sessionId);
-					this.broadcastControl({ type: "session_ended", sessionId });
-				}
-			} catch {
-				// skip
 			}
 		}
 	}
@@ -1018,6 +739,7 @@ class FileWatcher {
 		}
 
 		if (entry.type === "session_end") {
+			const session = this.activeSessions_.get(sessionId);
 			this.pushEvent(sessionId, {
 				type: "event", sessionId,
 				event: { type: "agent_end", agentId: agentIndex, depth, ts: entry.ts },
@@ -1029,73 +751,86 @@ class FileWatcher {
 					event: { type: "session_end", ts: entry.ts, usage: entry.usage },
 				});
 				this.bufferEndTimes.set(sessionId, Date.now());
+				const runName = session?.runName ?? "";
 				this.stopWatching(sessionId);
-				this.broadcastControl({ type: "session_ended", sessionId });
+				this.broadcastControl({ type: "session_ended", sessionId, runName });
 			}
 		}
 	}
 
 	// ── Directory watching ──────────────────────────────────────────
 
-	private watchDomainDir(logsDir: string): void {
-		console.log(`[watch] Watching domain dir: ${logsDir}`);
-		const watcher = watch(logsDir, (eventType, filename) => {
+	/** Watch a run's sessions directory for new session subdirs */
+	private watchRunSessionsDir(runName: string, sessionsDir: string): void {
+		console.log(`[watch] Watching run sessions dir: ${sessionsDir}`);
+		const watcher = watch(sessionsDir, (_, filename) => {
 			if (!filename) return;
-			const fullPath = join(logsDir, filename);
+			const fullPath = join(sessionsDir, filename);
+			if (!existsSync(fullPath) || !statSync(fullPath).isDirectory()) return;
 
-			// New format: directory with agent-*.jsonl
-			if (existsSync(fullPath) && statSync(fullPath).isDirectory()) {
-				console.log(`[watch] New session dir detected: ${filename}`);
+			const sid = `${runName}/${filename}`;
+			if (this.activeSessions_.has(sid)) return;
+
+			// Watch for agent-0.jsonl to appear
+			const agent0 = join(fullPath, "agent-0.jsonl");
+			if (existsSync(agent0)) {
+				this.watchSessionDir(sid, fullPath, runName);
+				this.broadcastControl({ type: "session_active", sessionId: sid, runName });
+			} else {
+				// Wait for agent-0.jsonl to appear
 				const innerWatcher = watch(fullPath, (_, innerFile) => {
 					if (innerFile === "agent-0.jsonl") {
-						if (!this.activeSessions_.has(filename)) {
-							this.watchSessionDir(filename, fullPath);
-							this.broadcastControl({ type: "session_active", sessionId: filename });
+						if (!this.activeSessions_.has(sid)) {
+							this.watchSessionDir(sid, fullPath, runName);
+							this.broadcastControl({ type: "session_active", sessionId: sid, runName });
 						}
 					}
 				});
 				this.dirWatchers.push(innerWatcher);
-				// Check immediately
-				if (!this.activeSessions_.has(filename) && existsSync(join(fullPath, "agent-0.jsonl"))) {
-					this.watchSessionDir(filename, fullPath);
-					this.broadcastControl({ type: "session_active", sessionId: filename });
-				}
-				return;
 			}
-
-			// Legacy format
-			if (!filename.endsWith(".jsonl")) return;
-			const sid = basename(filename, ".jsonl");
-			if (this.activeSessions_.has(sid)) return;
-			if (!existsSync(fullPath)) return;
-
-			let firstTs = Date.now() / 1000;
-			try {
-				const head = readFileSync(fullPath, "utf-8").split("\n")[0];
-				if (head) firstTs = JSON.parse(head).ts ?? firstTs;
-			} catch { /* use fallback */ }
-
-			this.watchLegacyFile(sid, fullPath, 0, firstTs);
-			this.broadcastControl({ type: "session_active", sessionId: sid });
 		});
 		this.dirWatchers.push(watcher);
 	}
 
 	watchDirectories(): void {
-		for (const domain of listDomains(LOGS_ROOT)) {
-			this.watchDomainDir(join(LOGS_ROOT, domain));
+		if (!existsSync(RUNS_ROOT)) {
+			mkdirSync(RUNS_ROOT, { recursive: true });
 		}
 
-		if (existsSync(LOGS_ROOT)) {
-			const rootWatcher = watch(LOGS_ROOT, (eventType, filename) => {
-				if (!filename) return;
-				const newDir = join(LOGS_ROOT, filename);
-				if (existsSync(newDir) && statSync(newDir).isDirectory()) {
-					this.watchDomainDir(newDir);
+		// Watch each existing run's sessions dir
+		for (const runEntry of readdirSync(RUNS_ROOT, { withFileTypes: true })) {
+			if (!runEntry.isDirectory()) continue;
+			const sessionsDir = join(RUNS_ROOT, runEntry.name, "sessions");
+			if (existsSync(sessionsDir)) {
+				this.watchRunSessionsDir(runEntry.name, sessionsDir);
+			}
+		}
+
+		// Watch runs/ root for new run directories appearing
+		const rootWatcher = watch(RUNS_ROOT, (_, filename) => {
+			if (!filename) return;
+			const runDir = join(RUNS_ROOT, filename);
+			if (!existsSync(runDir) || !statSync(runDir).isDirectory()) return;
+
+			const sessionsDir = join(runDir, "sessions");
+
+			// If sessions dir already exists, watch it
+			if (existsSync(sessionsDir)) {
+				this.watchRunSessionsDir(filename, sessionsDir);
+				this.broadcastControl({ type: "run_active", runName: filename });
+				return;
+			}
+
+			// Watch for sessions dir to be created
+			const runWatcher = watch(runDir, (_, innerName) => {
+				if (innerName === "sessions" && existsSync(join(runDir, "sessions"))) {
+					this.watchRunSessionsDir(filename, join(runDir, "sessions"));
+					this.broadcastControl({ type: "run_active", runName: filename });
 				}
 			});
-			this.dirWatchers.push(rootWatcher);
-		}
+			this.dirWatchers.push(runWatcher);
+		});
+		this.dirWatchers.push(rootWatcher);
 	}
 
 	// ── Helpers ─────────────────────────────────────────────────────
@@ -1106,6 +841,17 @@ class FileWatcher {
 
 	activeSessions(): string[] {
 		return [...this.activeSessions_.keys()];
+	}
+
+	/** Get active session IDs for a given run */
+	activeSessionsInRun(runName: string): string[] {
+		const result: string[] = [];
+		for (const sid of this.activeSessions_.keys()) {
+			if (sid.startsWith(runName + "/")) {
+				result.push(sid);
+			}
+		}
+		return result;
 	}
 
 	private stopWatching(sessionId: string): void {
@@ -1159,8 +905,7 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(port, () => {
 	console.log(`ARC Viewer API running on http://localhost:${port}`);
-	console.log(`  Scanning: ${LOGS_ROOT}/*/  and  ${RESULTS_ROOT}/*/`);
-	console.log(`  Domains: ${listDomains(LOGS_ROOT).join(", ") || "(none yet)"}`);
+	console.log(`  Scanning: ${RUNS_ROOT}/*/`);
 
 	fileWatcher = new FileWatcher(wss);
 	fileWatcher.scanForActiveSessions();

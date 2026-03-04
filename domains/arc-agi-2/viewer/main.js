@@ -1,13 +1,15 @@
 // ── State ───────────────────────────────────────────────────────────
 
-let sessions = [];
-let resultMap = {}; // taskId -> { correct, cost, tokens, model }
+let runs = [];
 let activeSessionId = null;
 let currentTurnCount = 0;
 let activeSessions = new Set();
 let streamingEl = null; // live-updating element for message_update deltas
 let streamingText = "";
 let streamingThinking = "";
+
+// Sidebar state — which runs are expanded
+const expandedRuns = new Set();
 
 // Dashboard state
 let dashboardMode = false;
@@ -22,24 +24,16 @@ const btnDashboard = document.getElementById("btn-dashboard");
 // ── Load data ───────────────────────────────────────────────────────
 
 async function init() {
-  const [sessData, resData] = await Promise.all([
-    fetch("/api/sessions").then((r) => r.json()),
-    fetch("/api/results").then((r) => r.json()),
-  ]);
+  const runsData = await fetch("/api/runs").then((r) => r.json());
+  runs = runsData;
 
-  sessions = sessData;
-
-  // Build result map from all result files
-  for (const rf of resData) {
-    const model = rf.config?.model || "";
-    for (const r of rf.results) {
-      resultMap[r.taskId] = { correct: r.correct, failed: r.failed, cost: r.cost, tokens: r.tokens, model };
+  // Populate activeSessions from run data
+  for (const run of runs) {
+    if (run._activeSessions) {
+      for (const sid of run._activeSessions) {
+        activeSessions.add(sid);
+      }
     }
-  }
-
-  // Populate activeSessions from session data
-  for (const s of sessions) {
-    if (s.active) activeSessions.add(s.sessionId);
   }
 
   renderSidebar();
@@ -49,88 +43,186 @@ async function init() {
 // ── Sidebar ─────────────────────────────────────────────────────────
 
 function renderSidebar() {
-  if (sessions.length === 0) {
+  if (runs.length === 0) {
     sidebar.innerHTML =
-      '<div class="no-sessions">No sessions found.<br>Run arc-runner with --log to create logs.</div>';
+      '<div class="no-sessions">No runs found.<br>Run arc-runner to create runs.</div>';
     return;
   }
 
-  // Group sessions by domain
-  const grouped = {};
-  for (const s of sessions) {
-    const d = s.domain || "unknown";
-    if (!grouped[d]) grouped[d] = [];
-    grouped[d].push(s);
-  }
-
-  const domains = Object.keys(grouped).sort();
-  const multiDomain = domains.length > 1;
-
   let html = "";
-  for (const domain of domains) {
-    if (multiDomain) {
-      html += '<div class="domain-header">' + esc(domain) + "</div>";
-    }
-    for (const s of grouped[domain]) {
-      const label = s.taskId || s.sessionId;
-      const result = s.taskId ? resultMap[s.taskId] : null;
-      const isLive = activeSessions.has(s.sessionId);
-      const badge = isLive
-        ? '<span class="badge live">LIVE</span>'
-        : result
-          ? result.correct
-            ? '<span class="badge ok">CORRECT</span>'
-            : result.failed
-              ? '<span class="badge fail">FAILED</span>'
-              : '<span class="badge err">WRONG</span>'
-          : "";
-      const domainTag = !multiDomain && s.domain
-        ? '<span class="domain-tag">' + esc(s.domain) + "</span>"
-        : "";
-      const cost = s.usage ? "$" + s.usage.totalCost.toFixed(4) : "";
-      const tokens = s.usage ? s.usage.totalTokens.toLocaleString() + " tok" : "";
-      const model = s.model || (result && result.model) || "";
-      const modelShort = model.replace("claude-", "").replace(/-\d{8,}$/, "");
-      const date = s.ts ? friendlyDate(s.ts) : "";
-      const line1 = [s.turns + " turns", cost, tokens].filter(Boolean).join(" \u00b7 ");
-      const line2 = [modelShort, date].filter(Boolean).join(" \u00b7 ");
+  for (const run of runs) {
+    const isExpanded = expandedRuns.has(run.name);
+    const summary = run.summary;
+    const correct = summary?.correct ?? 0;
+    const total = summary?.total ?? run.config?.taskIds?.length ?? 0;
+    const cost = summary?.cost ?? 0;
+    const hasActive = run._activeSessions?.length > 0;
+    const arrow = isExpanded ? "\u25BC" : "\u25B6";
 
-      html +=
-        '<div class="session-item" data-id="' +
-        esc(s.sessionId) +
-        '">' +
-        '<span class="task-id">' +
-        esc(label) +
-        "</span>" +
-        domainTag +
-        badge +
-        '<div class="meta">' +
-        esc(line1) +
-        "</div>" +
-        (line2 ? '<div class="meta">' + esc(line2) + "</div>" : "") +
-        "</div>";
+    // Run header
+    html +=
+      '<div class="run-group' + (hasActive ? " run-active" : "") + '">' +
+      '<div class="run-header" data-run="' + esc(run.name) + '">' +
+      '<span class="run-arrow">' + arrow + "</span>" +
+      '<span class="run-name">' + esc(run.name) + "</span>" +
+      '<span class="run-score">' + correct + "/" + total + "</span>" +
+      (cost > 0 ? '<span class="run-cost">$' + cost.toFixed(2) + "</span>" : "") +
+      (hasActive ? '<span class="badge live">LIVE</span>' : "") +
+      "</div>";
+
+    // Run description
+    if (run.description) {
+      html += '<div class="run-desc' + (isExpanded ? "" : " hidden") + '">' + esc(run.description) + "</div>";
     }
+
+    // Model + thinking info
+    const model = run.config?.model || "";
+    const modelShort = model.replace("claude-", "").replace(/-\d{8,}$/, "");
+    const thinking = run.config?.thinking || "";
+    const date = run.startedAt ? friendlyDate(Math.floor(new Date(run.startedAt).getTime() / 1000)) : "";
+    const configLine = [modelShort, thinking ? "think=" + thinking : "", date].filter(Boolean).join(" \u00b7 ");
+
+    if (isExpanded && configLine) {
+      html += '<div class="run-config">' + esc(configLine) + "</div>";
+    }
+
+    // Task rows (only when expanded)
+    if (isExpanded) {
+      html += '<div class="run-tasks">';
+      const results = run.results || [];
+      const taskIds = run.config?.taskIds || [];
+
+      // Build result map by taskId
+      const resultMap = {};
+      for (const r of results) {
+        resultMap[r.taskId] = r;
+      }
+
+      for (const tid of taskIds) {
+        const r = resultMap[tid];
+        const attempts = r?.attempts || [];
+        const numAttempts = attempts.length;
+        const isActive = activeSessions.has(run.name + "/" + tid + "_a0") ||
+          activeSessions.has(run.name + "/" + tid + "_a1");
+
+        // Status badge
+        let badge = "";
+        if (isActive) {
+          badge = '<span class="badge live">LIVE</span>';
+        } else if (r) {
+          if (r.correct) badge = '<span class="badge ok">\u2713</span>';
+          else if (r.failed) badge = '<span class="badge fail">FAIL</span>';
+          else badge = '<span class="badge err">\u2717</span>';
+        } else {
+          badge = '<span class="badge pending">\u2022\u2022\u2022</span>';
+        }
+
+        const taskCost = r ? "$" + r.cost.toFixed(2) : "";
+        const taskTime = r ? fmtTime(r.timeMs) : "";
+        const taskMeta = [taskCost, taskTime].filter(Boolean).join(" \u00b7 ");
+
+        if (numAttempts <= 1) {
+          // Single attempt — clicking loads the session directly
+          const sessionId = run.name + "/" + tid + "_a0";
+          html +=
+            '<div class="task-row" data-session="' + esc(sessionId) + '">' +
+            '<span class="task-id">' + esc(tid) + "</span>" +
+            badge +
+            (taskMeta ? '<span class="task-meta">' + esc(taskMeta) + "</span>" : "") +
+            "</div>";
+        } else {
+          // Multiple attempts — expandable
+          const taskExpanded = expandedRuns.has(run.name + ":" + tid);
+          const taskArrow = taskExpanded ? "\u25BC" : "\u25B6";
+
+          html +=
+            '<div class="task-row task-expandable" data-task-expand="' + esc(run.name + ":" + tid) + '">' +
+            '<span class="task-arrow">' + taskArrow + "</span>" +
+            '<span class="task-id">' + esc(tid) + "</span>" +
+            badge +
+            (taskMeta ? '<span class="task-meta">' + esc(taskMeta) + "</span>" : "") +
+            "</div>";
+
+          if (taskExpanded) {
+            for (let a = 0; a < numAttempts; a++) {
+              const att = attempts[a];
+              const sessionId = run.name + "/" + tid + "_a" + a;
+              const attActive = activeSessions.has(sessionId);
+              let attBadge = "";
+              if (attActive) attBadge = '<span class="badge live">LIVE</span>';
+              else if (att?.correct) attBadge = '<span class="badge ok">\u2713</span>';
+              else if (att?.failed) attBadge = '<span class="badge fail">FAIL</span>';
+              else attBadge = '<span class="badge err">\u2717</span>';
+
+              const attCost = att ? "$" + att.cost.toFixed(2) : "";
+              const attTime = att ? fmtTime(att.timeMs) : "";
+              const attMeta = [attCost, attTime].filter(Boolean).join(" \u00b7 ");
+
+              html +=
+                '<div class="attempt-row" data-session="' + esc(sessionId) + '">' +
+                '<span class="attempt-label">a' + a + "</span>" +
+                attBadge +
+                (attMeta ? '<span class="task-meta">' + esc(attMeta) + "</span>" : "") +
+                "</div>";
+            }
+          }
+        }
+      }
+      html += "</div>"; // .run-tasks
+    }
+
+    html += "</div>"; // .run-group
   }
   sidebar.innerHTML = html;
 
-  sidebar.querySelectorAll(".session-item").forEach((el) => {
+  // Event listeners — run headers toggle expand/collapse
+  sidebar.querySelectorAll(".run-header").forEach((el) => {
     el.addEventListener("click", () => {
-      if (dashboardMode) exitDashboard();
-      loadTrace(el.dataset.id);
+      const runName = el.dataset.run;
+      if (expandedRuns.has(runName)) {
+        expandedRuns.delete(runName);
+      } else {
+        expandedRuns.add(runName);
+      }
+      renderSidebar();
     });
   });
 
-  // Re-apply active highlight if a session is selected
+  // Task expand/collapse (for multi-attempt tasks)
+  sidebar.querySelectorAll(".task-expandable").forEach((el) => {
+    el.addEventListener("click", () => {
+      const key = el.dataset.taskExpand;
+      if (expandedRuns.has(key)) {
+        expandedRuns.delete(key);
+      } else {
+        expandedRuns.add(key);
+      }
+      renderSidebar();
+    });
+  });
+
+  // Session clicks — load trace
+  sidebar.querySelectorAll("[data-session]").forEach((el) => {
+    // Skip task-expandable rows (they handle their own click)
+    if (el.classList.contains("task-expandable")) return;
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (dashboardMode) exitDashboard();
+      loadTrace(el.dataset.session);
+    });
+  });
+
+  // Re-apply active highlight
   if (activeSessionId) {
-    sidebar.querySelectorAll(".session-item").forEach((el) => {
-      el.classList.toggle("active", el.dataset.id === activeSessionId);
+    sidebar.querySelectorAll("[data-session]").forEach((el) => {
+      el.classList.toggle("active", el.dataset.session === activeSessionId);
     });
   }
 }
 
-async function refreshSessions() {
-  const sessData = await fetch("/api/sessions").then((r) => r.json());
-  sessions = sessData;
+async function refreshRuns() {
+  const runsData = await fetch("/api/runs").then((r) => r.json());
+  runs = runsData;
   renderSidebar();
 }
 
@@ -146,8 +238,8 @@ async function loadTrace(sessionId) {
 
   activeSessionId = sessionId;
 
-  sidebar.querySelectorAll(".session-item").forEach((el) => {
-    el.classList.toggle("active", el.dataset.id === sessionId);
+  sidebar.querySelectorAll("[data-session]").forEach((el) => {
+    el.classList.toggle("active", el.dataset.session === sessionId);
   });
 
   // If session is active, use subscription-based streaming
@@ -496,7 +588,7 @@ function enterDashboard() {
   }
 
   if (dashboard.children.length === 0) {
-    dashboard.innerHTML = '<div class="no-sessions">No active sessions. Start a run with --log --stream.</div>';
+    dashboard.innerHTML = '<div class="no-sessions">No active sessions. Start a run with --stream.</div>';
   }
 
   // Subscribe to all sessions
@@ -530,9 +622,9 @@ function toggleDashboard() {
 function createDashboardPanel(sessionId) {
   if (dashboard.querySelector(`[data-session-id="${sessionId}"]`)) return;
 
-  // Find session info for label
-  const sessionInfo = sessions.find((s) => s.sessionId === sessionId);
-  const label = sessionInfo?.taskId || sessionId;
+  // Parse sessionId to get a label: "taskId_aN" from "runName/taskId_aN"
+  const parts = sessionId.split("/");
+  const label = parts.length > 1 ? parts[1] : sessionId;
 
   const panel = mk("div", "dashboard-panel");
   panel.dataset.sessionId = sessionId;
@@ -609,7 +701,11 @@ function connectWS() {
 
       case "session_active": {
         activeSessions.add(msg.sessionId);
-        refreshSessions();
+        // Auto-expand the run this session belongs to
+        if (msg.runName) {
+          expandedRuns.add(msg.runName);
+        }
+        refreshRuns();
         if (dashboardMode) {
           createDashboardPanel(msg.sessionId);
           // Remove "no sessions" placeholder
@@ -617,6 +713,15 @@ function connectWS() {
           if (placeholder) placeholder.remove();
           wsSend({ type: "subscribe", sessionId: msg.sessionId });
         }
+        break;
+      }
+
+      case "run_active": {
+        // A new run appeared — refresh sidebar
+        if (msg.runName) {
+          expandedRuns.add(msg.runName);
+        }
+        refreshRuns();
         break;
       }
 
@@ -652,7 +757,7 @@ function connectWS() {
 
       case "session_ended": {
         activeSessions.delete(msg.sessionId);
-        renderSidebar();
+        refreshRuns();
 
         if (dashboardMode) {
           // Mark panel as ended
@@ -714,6 +819,14 @@ function friendlyDate(ts) {
   if (hrs < 24) return hrs + "h ago";
   if (days < 7) return days + "d ago";
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function fmtTime(ms) {
+  if (!ms) return "";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  return m + "m" + (s % 60 ? (s % 60) + "s" : "");
 }
 
 function formatResult(result) {

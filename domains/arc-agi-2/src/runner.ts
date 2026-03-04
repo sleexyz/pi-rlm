@@ -19,6 +19,7 @@
  *   --task-ids-file <path> Run specific tasks listed in a file (one ID per line)
  *   --shard <n>            Shard index for parallel runs (0-based)
  *   --num-shards <n>       Total number of shards
+ *   --description <text>   Run description (saved to run.json)
  *   --resume <run-name>    Resume an interrupted run (skips completed tasks)
  *   --stream               Stream agent output to stdout
  *   --no-log               Disable session logging (still writes run.json)
@@ -130,6 +131,7 @@ const maxAgents = parseInt(getArg("--max-agents", "10"), 10);
 const shard = parseInt(getArg("--shard", "-1"), 10);
 const numShards = parseInt(getArg("--num-shards", "1"), 10);
 const taskIdsFile = getArg("--task-ids-file", "");
+const description = getArg("--description", "");
 const resumeRunName = getArg("--resume", "");
 const allTasks = args.includes("--all");
 const stream = args.includes("--stream");
@@ -142,6 +144,7 @@ const resolvedRunsDir = join(repoRoot, runsDir);
 
 interface RunJson {
 	name: string;
+	description?: string;
 	startedAt: string;
 	config: {
 		split: string;
@@ -233,6 +236,7 @@ const runJson: RunJson = resumedRun
 	? { ...resumedRun, name: effectiveRunName }
 	: {
 			name: effectiveRunName,
+			...(description ? { description } : {}),
 			startedAt: new Date().toISOString(),
 			config: {
 				split,
