@@ -1,20 +1,12 @@
-"""SDPO Training for ARC-AGI-2 on Modal
-
-Multi-turn SDPO using the existing verl + SDPO infrastructure from kirby,
-with ARC code execution via the TypeScript sandbox (EvalRuntime + createArcAdapter).
+"""SDPO Training & Baseline Evaluation for ARC on Modal
 
 Usage:
-    # One-time setup: create WandB secret
-    modal secret create wandb-secret WANDB_API_KEY=<your-key>
-
-    # Step 1: Prepare dataset (~5 min)
+    # Training (4xA100-80GB):
     modal run rl/modal_app.py::prep_data
-
-    # Step 2: Launch training (~8-12 hours on 4xA100-80GB)
     modal run --detach rl/modal_app.py::train
 
-    # Override hyperparams:
-    modal run --detach rl/modal_app.py::train -- trainer.total_epochs=2 data.train_batch_size=2
+    # Evaluation (1xA100-80GB per shard):
+    modal run rl/modal_app.py::evaluate -- --model Qwen/Qwen3-8B --dataset ARC-AGI-1 --count 5
 """
 
 import os
@@ -82,8 +74,11 @@ image = (
     .add_local_file("rl/arc_interaction.py", f"{RL_DIR}/arc_interaction.py", copy=True)
     .add_local_file("rl/arc_data.py", f"{RL_DIR}/arc_data.py", copy=True)
     .add_local_file("rl/arc_reward.py", f"{RL_DIR}/arc_reward.py", copy=True)
+    .add_local_file("rl/eval_loop.py", f"{RL_DIR}/eval_loop.py", copy=True)
+    .add_local_file("rl/trace_logger.py", f"{RL_DIR}/trace_logger.py", copy=True)
     # Copy ARC data
     .add_local_dir("downloads/ARC-AGI-2/data", "/app/downloads/ARC-AGI-2/data", copy=True)
+    .add_local_dir("downloads/ARC-AGI-1/data", "/app/downloads/ARC-AGI-1/data", copy=True)
     # Copy configs
     .add_local_file("rl/config/sdpo_arc.yaml", f"{SDPO_DIR}/verl/trainer/config/sdpo_arc.yaml", copy=True)
     .add_local_file("rl/config/arc_interaction_config.yaml", f"{RL_DIR}/config/arc_interaction_config.yaml", copy=True)
@@ -202,6 +197,146 @@ def train(*arglist):
 
     subprocess.run(cmd, check=True)
     checkpoints_volume.commit()
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    volumes={
+        DATA_PATH: data_volume,
+        HF_CACHE_PATH: hf_cache_volume,
+    },
+    timeout=86400,
+)
+def evaluate(
+    model: str = "Qwen/Qwen3-8B",
+    dataset: str = "ARC-AGI-1",
+    split: str = "training",
+    count: int = 100,
+    shard: int = 0,
+    num_shards: int = 1,
+    run_name: str = "",
+    max_turns: int = 15,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    max_tokens: int = 8192,
+):
+    """Evaluate ARC tasks on a single GPU. Shard for parallelism."""
+    import json
+    import sys
+    from datetime import datetime, timezone
+
+    sys.path.insert(0, f"{RL_DIR}/..")
+    hf_cache_volume.reload()
+
+    from rl.arc_data import generate_prompt_via_ts, load_arc_tasks
+    from rl.eval_loop import evaluate_tasks
+    from rl.trace_logger import write_run_json
+
+    data_dir = f"/app/downloads/{dataset}/data"
+
+    # Load and shard tasks
+    print(f"=== Loading {dataset} {split} tasks ===")
+    all_tasks = load_arc_tasks(split, data_dir=data_dir)[:count]
+    tasks = [t for i, t in enumerate(all_tasks) if i % num_shards == shard]
+    print(f"Shard {shard}/{num_shards}: {len(tasks)} tasks (of {len(all_tasks)} total)")
+
+    if not tasks:
+        print("No tasks for this shard, exiting.")
+        return
+
+    # Generate run name
+    if not run_name:
+        model_short = model.split("/")[-1].lower()
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        run_name = f"{model_short}_{dataset}_{split}_{count}_{ts}"
+
+    # Generate system prompt (task-independent)
+    print("=== Generating system prompt ===")
+    system_prompt = generate_prompt_via_ts(tasks[0]["task"])
+
+    run_dir = f"{DATA_PATH}/eval-runs/{run_name}"
+    os.makedirs(run_dir, exist_ok=True)
+
+    print("=" * 64)
+    print(f"ARC Baseline Evaluation")
+    print(f"Model: {model}")
+    print(f"Dataset: {dataset} / {split}")
+    print(f"Tasks: {len(tasks)} (shard {shard}/{num_shards})")
+    print(f"Run: {run_name}")
+    print("=" * 64)
+
+    config = evaluate_tasks(
+        model_name=model,
+        tasks=tasks,
+        system_prompt=system_prompt,
+        run_dir=run_dir,
+        run_name=run_name,
+        max_turns=max_turns,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )
+
+    # Write per-shard results
+    shard_path = os.path.join(run_dir, f"shard-{shard}.json")
+    run_json_path = os.path.join(run_dir, "run.json")
+    with open(run_json_path) as f:
+        run_data = json.load(f)
+    with open(shard_path, "w") as f:
+        json.dump(run_data, f, indent=2)
+
+    # Create tar archive for reliable download (modal volume get has issues with nested dirs)
+    import tarfile
+    tar_path = os.path.join(run_dir, f"shard-{shard}-traces.tar.gz")
+    sessions_dir = os.path.join(run_dir, "sessions")
+    with tarfile.open(tar_path, "w:gz") as tar:
+        tar.add(sessions_dir, arcname="sessions")
+
+    data_volume.commit()
+    print(f"\n=== Shard {shard} complete. Results at {shard_path} ===")
+
+
+@app.function(
+    image=image,
+    volumes={DATA_PATH: data_volume},
+    timeout=300,
+)
+def pack_run(run_name: str = ""):
+    """Pack a run into a single tar.gz for reliable download.
+
+    Usage:
+        modal run rl/modal_app.py::pack_run --run-name <name>
+        modal volume get sdpo-arc-data eval-runs/<name>/run.tar.gz runs/<name>/run.tar.gz
+        cd runs/<name> && tar xzf run.tar.gz
+    """
+    import json
+    import tarfile
+
+    data_volume.reload()
+    run_dir = f"{DATA_PATH}/eval-runs/{run_name}"
+
+    if not os.path.exists(run_dir):
+        print(f"Run dir not found: {run_dir}")
+        return
+
+    tar_path = os.path.join(run_dir, "run.tar.gz")
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for item in ["run.json", "sessions"]:
+            path = os.path.join(run_dir, item)
+            if os.path.exists(path):
+                tar.add(path, arcname=item)
+        # Add shard files
+        for f in sorted(os.listdir(run_dir)):
+            if f.startswith("shard-") and f.endswith(".json"):
+                tar.add(os.path.join(run_dir, f), arcname=f)
+
+    data_volume.commit()
+    size_mb = os.path.getsize(tar_path) / (1024 * 1024)
+    print(f"Packed {run_name} -> {tar_path} ({size_mb:.1f} MB)")
+    print(f"\nDownload with:")
+    print(f"  modal volume get sdpo-arc-data eval-runs/{run_name}/run.tar.gz runs/{run_name}/run.tar.gz")
+    print(f"  cd runs/{run_name} && tar xzf run.tar.gz")
 
 
 @app.local_entrypoint()
