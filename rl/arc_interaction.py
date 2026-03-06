@@ -1,12 +1,10 @@
 """
 ARC Interaction — bridges verl's rollout engine to the TS execution environment.
 
-Implements verl's BaseInteraction interface. Delegates code execution to
-long-lived bun subprocesses running sandbox-server.ts (which reuses
-EvalRuntime + createArcAdapter for zero execution skew).
+Delegates all code parsing, execution, and feedback formatting to ArcEnv
+(which wraps sandbox-agent.ts) for zero skew between training and eval.
 
 verl calling convention:
-  - interaction_kwargs comes from extra_info["interaction_kwargs"] in the data row
   - start_interaction(request_id, **interaction_kwargs) is called once per rollout
   - generate_response(request_id, messages, **interaction_kwargs) is called each turn
 """
@@ -14,8 +12,7 @@ verl calling convention:
 from typing import Any, Optional
 from uuid import uuid4
 
-from .js_sandbox import SandboxPool
-from .parser import parse_tool_call
+from .arc_env import ArcEnv
 
 
 class ArcInteraction:
@@ -29,8 +26,7 @@ class ArcInteraction:
     def __init__(self, config: dict[str, Any] | None = None, tasks: dict[str, dict] | None = None):
         self.config = config or {}
         self.tasks = tasks or {}
-        self.pool = SandboxPool()
-        self._instance_meta: dict[str, dict] = {}
+        self.envs: dict[str, ArcEnv] = {}
         self.name = config.get("name", "arc") if config else "arc"
 
     async def start_interaction(
@@ -40,80 +36,40 @@ class ArcInteraction:
             instance_id = str(uuid4())
 
         task_id = kwargs.get("task_id", instance_id)
-
-        # Task data from kwargs (verl pipeline) or constructor (testing)
         task = kwargs.get("task") or self.tasks.get(task_id)
         if task is None:
             raise ValueError(f"Unknown task_id: {task_id}")
 
-        self._instance_meta[instance_id] = {
-            "task_id": task_id,
-            "task": task,
-            "turns": 0,
-        }
-        # Pre-create the sandbox session
-        self.pool.get_or_create(instance_id, task)
+        self.envs[instance_id] = ArcEnv(task)
         return instance_id
 
     async def generate_response(
         self, instance_id: str, messages: list[dict[str, Any]], **kwargs
     ) -> tuple[bool, str, float, dict[str, Any]]:
-        meta = self._instance_meta.get(instance_id)
-        if meta is None:
+        env = self.envs.get(instance_id)
+        if env is None:
             # Auto-init if start_interaction wasn't called explicitly
             task_id = kwargs.get("task_id", instance_id)
             task = kwargs.get("task") or self.tasks.get(task_id)
             if task is None:
-                return False, "No code blocks found.", 0.0, {}
-            meta = {"task_id": task_id, "task": task, "turns": 0}
-            self._instance_meta[instance_id] = meta
-            self.pool.get_or_create(instance_id, task)
+                return False, "No code found. Write a ```javascript block to execute code.", 0.0, {}
+            env = ArcEnv(task)
+            self.envs[instance_id] = env
 
-        meta["turns"] += 1
-
-        # Extract latest assistant message
+        # Extract latest assistant message content
         content = ""
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "assistant":
                 content = messages[i].get("content", "")
                 break
 
-        # Extract code from tool call
-        code = parse_tool_call(content)
-
-        if not code:
-            return False, "No code found. Use the eval tool to execute JavaScript code.", 0.0, {"submitted": False}
-
-        # Execute code
-        session = self.pool.get_or_create(instance_id, meta["task"])
-        result = session.eval(code)
-
-        # Format feedback
-        output = result.get("stdout", "") or ""
-        if result.get("error"):
-            output = result["error"] if not output else f"{output}\n\nError: {result['error']}"
-        combined_feedback = output or "(no output)"
-        submitted = result.get("submitted")
-
-        # Compute reward
-        reward = 0.0
-        if submitted is not None:
-            expected = meta["task"]["test"][0]["output"]
-            reward = 1.0 if submitted == expected else 0.0
-
-        should_terminate = submitted is not None
-        metrics = {
-            "submitted": submitted is not None,
-            "accuracy": reward,
-            "turns": meta["turns"],
-        }
-
-        return should_terminate, combined_feedback, reward, metrics
+        feedback, reward, done, info = env.step(content)
+        return done, feedback, reward, info
 
     async def calculate_score(self, instance_id: str, **kwargs) -> float:
-        meta = self._instance_meta.get(instance_id, {})
-        return meta.get("last_reward", 0.0)
+        return 0.0
 
     async def finalize_interaction(self, instance_id: str, **kwargs) -> None:
-        self.pool.close(instance_id)
-        self._instance_meta.pop(instance_id, None)
+        env = self.envs.pop(instance_id, None)
+        if env:
+            env.close()

@@ -76,8 +76,7 @@ image = (
     .run_commands("cd /app && /root/.bun/bin/bun install")
     # Copy Python RL code
     .add_local_file("rl/__init__.py", f"{RL_DIR}/__init__.py", copy=True)
-    .add_local_file("rl/parser.py", f"{RL_DIR}/parser.py", copy=True)
-    .add_local_file("rl/js_sandbox.py", f"{RL_DIR}/js_sandbox.py", copy=True)
+    .add_local_file("rl/arc_env.py", f"{RL_DIR}/arc_env.py", copy=True)
     .add_local_file("rl/arc_data.py", f"{RL_DIR}/arc_data.py", copy=True)
     .add_local_file("rl/arc_interaction.py", f"{RL_DIR}/arc_interaction.py", copy=True)
     .add_local_file("rl/arc_reward.py", f"{RL_DIR}/arc_reward.py", copy=True)
