@@ -2,18 +2,14 @@
 ARC-AGI-2 data loader for verl SDPO training.
 
 Loads ARC tasks and produces parquet files in verl's expected format.
-Eval prompt generation is handled by Bun (agent-runner.ts).
-generate_prompt_via_ts is still used for training data prep (parquet creation).
+System prompt generation uses ArcEnv (sandbox-agent.ts) — the single source of truth.
 """
 
 import json
 import os
-import subprocess
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-GENERATE_PROMPT_SCRIPT = PROJECT_ROOT / "domains" / "arc-agi-2" / "src" / "generate-prompt.ts"
-DEFAULT_DATA_DIR = PROJECT_ROOT / "downloads" / "ARC-AGI-2" / "data"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "downloads" / "ARC-AGI-2" / "data"
 
 
 def load_arc_tasks(split: str, data_dir: str | None = None) -> list[dict]:
@@ -35,21 +31,16 @@ def load_arc_tasks(split: str, data_dir: str | None = None) -> list[dict]:
     return tasks
 
 
-def generate_prompt_via_ts(task: dict) -> str:
-    """Generate system prompt by calling the existing TS function via bun.
-
-    This ensures the system prompt matches exactly what the inference runner uses.
-    """
-    result = subprocess.run(
-        ["bun", "run", str(GENERATE_PROMPT_SCRIPT)],
-        input=json.dumps(task).encode(),
-        capture_output=True,
-        cwd=str(PROJECT_ROOT),
-        timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"generate-prompt.ts failed: {result.stderr.decode()}")
-    return result.stdout.decode()
+def generate_system_prompt(task: dict) -> str:
+    """Generate system prompt via ArcEnv (sandbox-agent.ts) — single source of truth."""
+    try:
+        from rl.arc_env import ArcEnv
+    except ImportError:
+        from arc_env import ArcEnv
+    env = ArcEnv(task)
+    obs = env.reset()
+    env.close()
+    return obs["systemPrompt"]
 
 
 def prepare_verl_dataset(tasks: list[dict]) -> "pandas.DataFrame":
@@ -65,7 +56,7 @@ def prepare_verl_dataset(tasks: list[dict]) -> "pandas.DataFrame":
     import pandas as pd
 
     # System prompt is task-independent — generate once
-    system_prompt = generate_prompt_via_ts(tasks[0]["task"])
+    system_prompt = generate_system_prompt(tasks[0]["task"])
 
     rows = []
     for item in tasks:
