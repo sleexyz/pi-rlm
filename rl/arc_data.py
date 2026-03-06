@@ -1,8 +1,9 @@
 """
 ARC-AGI-2 data loader for verl SDPO training.
 
-Loads ARC tasks, generates system prompts via the existing TS stack,
-and produces parquet files in verl's expected format.
+Loads ARC tasks and produces parquet files in verl's expected format.
+Eval prompt generation is handled by Bun (agent-runner.ts).
+generate_prompt_via_ts is still used for training data prep (parquet creation).
 """
 
 import json
