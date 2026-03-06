@@ -46,3 +46,15 @@ export { SessionLogger, type SessionLoggerOptions } from "./session-logger.js";
 // Per-agent message logging
 export { AgentLogger, type AgentLoggerOptions } from "./agent-logger.js";
 export { SessionDir, type SessionDirOptions } from "./session-dir.js";
+
+// REPL stream (text code block models like RLM Qwen3-8B)
+export {
+	createCodeBlockStreamFn,
+	createReplStreamFn,
+	createVllmModel,
+	generateCodeBlockSystemPrompt,
+	generateReplSystemPrompt,
+	parseReplBlocks,
+	transformMessagesForRepl,
+	type CodeBlockStreamOptions,
+} from "./repl-stream.js";

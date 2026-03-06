@@ -6,7 +6,7 @@ Usage:
     modal run --detach rl/modal_app.py::train
 
     # Evaluation (1xA100-80GB per shard):
-    modal run rl/modal_app.py::evaluate -- --model Qwen/Qwen3-8B --dataset ARC-AGI-1 --count 5
+    modal run rl/modal_app.py::evaluate --model Qwen/Qwen3-8B --dataset ARC-AGI-1 --count 5
 """
 
 import os
@@ -58,17 +58,24 @@ image = (
         f"git clone https://github.com/lasgroup/SDPO.git {SDPO_DIR}",
         f"cd {SDPO_DIR} && pip install -e .",
     )
-    # Install Bun (for TS sandbox)
+    # Install Bun (for TS agent harness)
     .run_commands(
         "curl -fsSL https://bun.sh/install | bash",
         'echo \'export BUN_INSTALL="$HOME/.bun"\' >> /root/.bashrc',
         'echo \'export PATH="$HOME/.bun/bin:$PATH"\' >> /root/.bashrc',
     )
-    # Copy TS source files — must match js_sandbox.py's PROJECT_ROOT layout (/app/)
+    # Copy workspace structure — enables `import ... from "pi-rlm"` in Bun
+    .add_local_file("package.json", "/app/package.json", copy=True)
+    # pi-rlm: source + built dist + package.json
+    .add_local_file("pi-rlm/package.json", "/app/pi-rlm/package.json", copy=True)
     .add_local_dir("pi-rlm/src", "/app/pi-rlm/src", copy=True)
+    .add_local_dir("pi-rlm/dist", "/app/pi-rlm/dist", copy=True)
+    # domains/arc-agi-2: source + viewer + package.json
+    .add_local_file("domains/arc-agi-2/package.json", "/app/domains/arc-agi-2/package.json", copy=True)
     .add_local_dir("domains/arc-agi-2/src", "/app/domains/arc-agi-2/src", copy=True)
     .add_local_dir("domains/arc-agi-2/viewer", "/app/domains/arc-agi-2/viewer", copy=True)
-    .run_commands("cd /app/domains/arc-agi-2 && /root/.bun/bin/bun add ws")
+    # Install workspace deps (resolves workspace:* + npm packages)
+    .run_commands("cd /app && /root/.bun/bin/bun install")
     # Copy Python RL code (exclude venv/cache)
     .add_local_file("rl/__init__.py", f"{RL_DIR}/__init__.py", copy=True)
     .add_local_file("rl/parser.py", f"{RL_DIR}/parser.py", copy=True)
@@ -98,6 +105,47 @@ image = (
 )
 
 
+def start_vllm_server(
+    model: str,
+    port: int = 8000,
+    max_logprobs: int = 100,
+    max_model_len: int = 32768,
+    gpu_memory_utilization: float = 0.9,
+) -> subprocess.Popen:
+    """Start vLLM as an OpenAI-compatible HTTP server."""
+    cmd = [
+        "python", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", model,
+        "--port", str(port),
+        "--max-model-len", str(max_model_len),
+        "--max-logprobs", str(max_logprobs),
+        "--gpu-memory-utilization", str(gpu_memory_utilization),
+        "--trust-remote-code",
+    ]
+    print(f"Starting vLLM server: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def wait_for_server(port: int = 8000, timeout: int = 300) -> None:
+    """Poll vLLM health endpoint until ready."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    url = f"http://localhost:{port}/health"
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            resp = urllib.request.urlopen(url, timeout=5)
+            if resp.status == 200:
+                print(f"vLLM server ready after {time.time() - start:.1f}s")
+                return
+        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+            pass
+        time.sleep(2)
+    raise TimeoutError(f"vLLM server not ready after {timeout}s")
+
+
 @app.function(
     image=image,
     volumes={DATA_PATH: data_volume, HF_CACHE_PATH: hf_cache_volume},
@@ -121,8 +169,6 @@ def prep_data():
     subprocess.run(["/root/.bun/bin/bun", "--version"], check=True)
 
     from rl.arc_data import load_arc_tasks, prepare_verl_dataset, save_parquet
-
-    # No path overrides needed — TS files are at /app/ matching js_sandbox.py layout
 
     print("=== Loading ARC training tasks ===")
     train_tasks = load_arc_tasks("training")
@@ -221,9 +267,9 @@ def evaluate(
     max_turns: int = 15,
     temperature: float = 0.6,
     top_p: float = 0.95,
-    max_tokens: int = 8192,
+    timeout_per_task: int = 300,
 ):
-    """Evaluate ARC tasks on a single GPU. Shard for parallelism."""
+    """Evaluate ARC tasks: vLLM HTTP server + agent-runner.ts subprocesses."""
     import json
     import sys
     from datetime import datetime, timezone
@@ -231,9 +277,8 @@ def evaluate(
     sys.path.insert(0, f"{RL_DIR}/..")
     hf_cache_volume.reload()
 
-    from rl.arc_data import generate_prompt_via_ts, load_arc_tasks
+    from rl.arc_data import load_arc_tasks
     from rl.eval_loop import evaluate_tasks
-    from rl.trace_logger import write_run_json
 
     data_dir = f"/app/downloads/{dataset}/data"
 
@@ -253,47 +298,62 @@ def evaluate(
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         run_name = f"{model_short}_{dataset}_{split}_{count}_{ts}"
 
-    # Generate system prompt (task-independent)
-    print("=== Generating system prompt ===")
-    system_prompt = generate_prompt_via_ts(tasks[0]["task"])
-
     run_dir = f"{DATA_PATH}/eval-runs/{run_name}"
     os.makedirs(run_dir, exist_ok=True)
 
+    # Start vLLM HTTP server
+    print("=== Starting vLLM server ===")
+    server = start_vllm_server(model, port=8000)
+    try:
+        wait_for_server(port=8000, timeout=300)
+    except TimeoutError:
+        server.terminate()
+        raise
+
+    vllm_base_url = "http://localhost:8000/v1"
+
     print("=" * 64)
-    print(f"ARC Baseline Evaluation")
+    print("ARC Evaluation (unified harness)")
     print(f"Model: {model}")
     print(f"Dataset: {dataset} / {split}")
     print(f"Tasks: {len(tasks)} (shard {shard}/{num_shards})")
     print(f"Run: {run_name}")
+    print(f"vLLM: {vllm_base_url}")
     print("=" * 64)
 
-    config = evaluate_tasks(
-        model_name=model,
-        tasks=tasks,
-        system_prompt=system_prompt,
-        run_dir=run_dir,
-        run_name=run_name,
-        max_turns=max_turns,
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-    )
+    try:
+        evaluate_tasks(
+            model_name=model,
+            tasks=tasks,
+            run_dir=run_dir,
+            run_name=run_name,
+            vllm_base_url=vllm_base_url,
+            max_turns=max_turns,
+            temperature=temperature,
+            top_p=top_p,
+            timeout=timeout_per_task,
+        )
+    finally:
+        print("=== Stopping vLLM server ===")
+        server.terminate()
+        server.wait(timeout=10)
 
     # Write per-shard results
     shard_path = os.path.join(run_dir, f"shard-{shard}.json")
     run_json_path = os.path.join(run_dir, "run.json")
-    with open(run_json_path) as f:
-        run_data = json.load(f)
-    with open(shard_path, "w") as f:
-        json.dump(run_data, f, indent=2)
+    if os.path.exists(run_json_path):
+        with open(run_json_path) as f:
+            run_data = json.load(f)
+        with open(shard_path, "w") as f:
+            json.dump(run_data, f, indent=2)
 
-    # Create tar archive for reliable download (modal volume get has issues with nested dirs)
+    # Create tar archive for reliable download
     import tarfile
-    tar_path = os.path.join(run_dir, f"shard-{shard}-traces.tar.gz")
     sessions_dir = os.path.join(run_dir, "sessions")
-    with tarfile.open(tar_path, "w:gz") as tar:
-        tar.add(sessions_dir, arcname="sessions")
+    if os.path.exists(sessions_dir):
+        tar_path = os.path.join(run_dir, f"shard-{shard}-traces.tar.gz")
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(sessions_dir, arcname="sessions")
 
     data_volume.commit()
     print(f"\n=== Shard {shard} complete. Results at {shard_path} ===")
@@ -344,7 +404,6 @@ def pack_run(run_name: str = ""):
 @app.function(
     image=image,
     volumes={DATA_PATH: data_volume},
-    min_containers=1,
     cpu=2,
     memory=2048,
 )

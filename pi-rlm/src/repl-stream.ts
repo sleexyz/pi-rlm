@@ -170,6 +170,88 @@ function genToolCallId(): string {
 	return `repl_${Date.now()}_${toolCallCounter++}`;
 }
 
+export interface CodeBlockStreamOptions {
+	/** Number of top logprobs per token to request (0 = disabled). Only works with vLLM. */
+	topLogprobs?: number;
+}
+
+/**
+ * Direct fetch to a vLLM/OpenAI-compatible server, returning full text + logprobs.
+ * Used when topLogprobs > 0 (training mode). Non-streaming since we collect everything anyway.
+ */
+async function fetchWithLogprobs(
+	model: Model<any>,
+	context: Context,
+	options: SimpleStreamOptions | undefined,
+	topLogprobs: number,
+): Promise<{ text: string; usage: AssistantMessage["usage"]; logprobs: unknown[] }> {
+	const messages: { role: string; content: string }[] = [];
+	if (context.systemPrompt) {
+		messages.push({ role: "system", content: context.systemPrompt });
+	}
+	for (const msg of context.messages) {
+		if (msg.role === "user") {
+			const text = typeof msg.content === "string"
+				? msg.content
+				: msg.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("");
+			messages.push({ role: "user", content: text });
+		} else if (msg.role === "assistant") {
+			const text = msg.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("");
+			messages.push({ role: "assistant", content: text });
+		}
+	}
+
+	const body: Record<string, unknown> = {
+		model: model.id,
+		messages,
+		temperature: options?.temperature,
+		max_tokens: options?.maxTokens ?? model.maxTokens,
+		logprobs: true,
+		top_logprobs: topLogprobs,
+		stream: false,
+	};
+
+	// Let onPayload inject extra params (e.g. top_p)
+	options?.onPayload?.(body);
+	// Ensure logprobs params aren't overridden
+	body.logprobs = true;
+	body.top_logprobs = topLogprobs;
+	body.stream = false;
+
+	const response = await fetch(`${model.baseUrl}/chat/completions`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: options?.signal,
+	});
+
+	if (!response.ok) {
+		const errorText = await response.text();
+		throw new Error(`vLLM API error (${response.status}): ${errorText}`);
+	}
+
+	const data = (await response.json()) as {
+		choices: Array<{ message: { content?: string }; logprobs?: { content?: unknown[] } }>;
+		usage?: { prompt_tokens?: number; completion_tokens?: number };
+	};
+	const choice = data.choices[0];
+	const promptTokens = data.usage?.prompt_tokens ?? 0;
+	const completionTokens = data.usage?.completion_tokens ?? 0;
+
+	return {
+		text: choice.message.content ?? "",
+		usage: {
+			input: promptTokens,
+			output: completionTokens,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: promptTokens + completionTokens,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		logprobs: choice.logprobs?.content ?? [],
+	};
+}
+
 /**
  * Create a StreamFn that uses ```js code blocks instead of tool calling.
  *
@@ -182,11 +264,17 @@ function genToolCallId(): string {
  * - Outbound: strips tools, transforms history to code-block text format
  * - Inbound: parses ```js blocks into synthetic toolcall events
  *
+ * When `topLogprobs > 0`, bypasses streamSimple and calls the vLLM API directly
+ * to capture per-token logprobs. The logprobs are attached to the AssistantMessage
+ * as an extra `logprobs` property.
+ *
  * Usage:
  *   const streamFn = createCodeBlockStreamFn();
  *   new Orchestrator({ model, streamFn, generateSystemPrompt: generateCodeBlockSystemPrompt, ... });
  */
-export function createCodeBlockStreamFn(): StreamFn {
+export function createCodeBlockStreamFn(opts?: CodeBlockStreamOptions): StreamFn {
+	const topLogprobs = opts?.topLogprobs ?? 0;
+
 	return (model: Model<any>, context: Context, options?: SimpleStreamOptions) => {
 		// Transform context: strip tools + convert history to code-block text format
 		const transformedContext: Context = {
@@ -199,27 +287,38 @@ export function createCodeBlockStreamFn(): StreamFn {
 
 		(async () => {
 			try {
-				// Use generic streamSimple — works with any provider
-				const upstream = streamSimple(model, transformedContext, options);
-
-				// Collect full response text + usage
 				let fullText = "";
-				let finalMessage: AssistantMessage | null = null;
+				let usage: AssistantMessage["usage"];
+				let logprobsData: unknown[] | undefined;
 
-				for await (const event of upstream) {
-					if (event.type === "text_delta") {
-						fullText += event.delta;
-					} else if (event.type === "done") {
-						finalMessage = event.message;
-					} else if (event.type === "error") {
-						output.push(event);
-						output.end();
-						return;
+				if (topLogprobs > 0) {
+					// Direct API call to capture logprobs (training mode)
+					const result = await fetchWithLogprobs(model, transformedContext, options, topLogprobs);
+					fullText = result.text;
+					usage = result.usage;
+					logprobsData = result.logprobs;
+				} else {
+					// Use generic streamSimple — works with any provider
+					const upstream = streamSimple(model, transformedContext, options);
+
+					let finalMessage: AssistantMessage | null = null;
+
+					for await (const event of upstream) {
+						if (event.type === "text_delta") {
+							fullText += event.delta;
+						} else if (event.type === "done") {
+							finalMessage = event.message;
+						} else if (event.type === "error") {
+							output.push(event);
+							output.end();
+							return;
+						}
 					}
-				}
 
-				if (!finalMessage) {
-					throw new Error("No final message from upstream");
+					if (!finalMessage) {
+						throw new Error("No final message from upstream");
+					}
+					usage = finalMessage.usage;
 				}
 
 				// Parse text into segments
@@ -232,10 +331,15 @@ export function createCodeBlockStreamFn(): StreamFn {
 					api: model.api,
 					provider: model.provider,
 					model: model.id,
-					usage: finalMessage.usage,
-					stopReason: segments.some((s) => s.type === "code") ? "toolUse" : finalMessage.stopReason,
+					usage,
+					stopReason: segments.some((s) => s.type === "code") ? "toolUse" : "stop",
 					timestamp: Date.now(),
 				};
+
+				// Attach logprobs as extra property (survives in agent's message history)
+				if (logprobsData && logprobsData.length > 0) {
+					(outMessage as any).logprobs = logprobsData;
+				}
 
 				output.push({ type: "start", partial: outMessage });
 

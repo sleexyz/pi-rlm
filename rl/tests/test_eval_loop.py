@@ -1,9 +1,9 @@
-"""Tests for eval_loop — mocks vLLM engine to verify loop logic."""
+"""Tests for eval_loop — mocks agent-runner.ts subprocess to verify dispatch logic."""
 
 import json
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,77 +18,43 @@ SAMPLE_TASK = {
 }
 
 
-def _make_mock_llm(tokenizer):
-    """Create a mock vLLM LLM that returns output matching tokenizer.decode."""
-    mock_llm = MagicMock()
-    output = MagicMock()
-    output.token_ids = [10, 11, 12]
-    completion = MagicMock()
-    completion.outputs = [output]
-    mock_llm.generate.return_value = [completion]
-    return mock_llm
+def _mock_subprocess_result(task_id, correct=True, turns=3, tokens=500, time_ms=2000):
+    """Create a mock subprocess.CompletedProcess with agent-runner JSON output."""
+    result = {
+        "taskId": task_id,
+        "reward": 1.0 if correct else 0.0,
+        "submitted": True,
+        "correct": correct,
+        "turns": turns,
+        "tokens": tokens,
+        "timeMs": time_ms,
+        "trajectory": [],
+        "attempts": [{"correct": correct, "tokens": tokens, "timeMs": time_ms}],
+    }
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = json.dumps(result).encode()
+    mock.stderr = b""
+    return mock
 
 
-def _make_mock_interaction(terminate_on_turn=2, reward=1.0):
-    """Create a mock ArcInteraction that terminates on a given turn."""
-    mock_interaction = MagicMock()
-    mock_interaction.pool = MagicMock()
-    call_count = {"n": 0}
-
-    async def mock_start(instance_id=None, **kwargs):
-        return instance_id
-
-    async def mock_generate(instance_id, messages, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] >= terminate_on_turn:
-            return True, "Submitted. Reward: 1.0", reward, {"submitted": True}
-        return False, "hi", 0.0, {"submitted": False}
-
-    async def mock_finalize(instance_id, **kwargs):
-        pass
-
-    mock_interaction.start_interaction = AsyncMock(side_effect=mock_start)
-    mock_interaction.generate_response = AsyncMock(side_effect=mock_generate)
-    mock_interaction.finalize_interaction = AsyncMock(side_effect=mock_finalize)
-    return mock_interaction
-
-
-def test_eval_loop_single_task():
-    """Verify the eval loop processes a task and produces correct output."""
-    call_count = {"n": 0}
-
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.apply_chat_template.return_value = [1, 2, 3, 4, 5]
-
-    def decode_side_effect(ids, skip_special_tokens=True):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            return 'Let me analyze...\n<tool_call>\n{"name": "eval", "arguments": {"code": "function transform(grid) { return grid.map(r => r.map(() => 1)); }"}}\n</tool_call>'
-        else:
-            return '<tool_call>\n{"name": "eval", "arguments": {"code": "submit(transform)"}}\n</tool_call>'
-
-    mock_tokenizer.decode.side_effect = decode_side_effect
-
-    mock_llm = _make_mock_llm(mock_tokenizer)
-    mock_interaction = _make_mock_interaction(terminate_on_turn=2, reward=1.0)
-
+def test_eval_loop_single_task_correct():
+    """Verify the eval loop dispatches a task and collects the result."""
     from rl.eval_loop import evaluate_tasks
 
     tasks = [{"id": "test001", "task": SAMPLE_TASK}]
 
     with tempfile.TemporaryDirectory() as tmp, \
-         patch("rl.eval_loop.ArcInteraction", return_value=mock_interaction):
+         patch("rl.eval_loop.subprocess.run", return_value=_mock_subprocess_result("test001", correct=True)):
         run_dir = os.path.join(tmp, "test-run")
-        evaluate_tasks(
+        os.makedirs(run_dir, exist_ok=True)
+
+        config = evaluate_tasks(
             model_name="test-model",
             tasks=tasks,
-            system_prompt="You are an ARC solver.",
             run_dir=run_dir,
             run_name="test-run",
-            max_turns=5,
-            llm=mock_llm,
-            tokenizer=mock_tokenizer,
-            sampling_params=MagicMock(),
+            vllm_base_url="http://localhost:8000/v1",
         )
 
         # Verify run.json was written
@@ -101,66 +67,110 @@ def test_eval_loop_single_task():
         result = data["results"][0]
         assert result["taskId"] == "test001"
         assert result["correct"] is True
-        assert result["turns"] == 2
-        assert result["reward"] == 1.0
 
-        # Verify trace was written
-        trace_path = os.path.join(run_dir, "sessions", "test001_a0", "agent-0.jsonl")
-        assert os.path.exists(trace_path)
-        with open(trace_path) as f:
-            lines = [json.loads(l) for l in f if l.strip()]
-
-        assert lines[0]["type"] == "session"
-        assert lines[1]["type"] == "message"
-        assert lines[1]["message"]["role"] == "user"
-        assert lines[2]["type"] == "message"
-        assert lines[2]["message"]["role"] == "assistant"
-        assert lines[-1]["type"] == "session_end"
-
-        # Verify tokenizer was called with enable_thinking=False
-        mock_tokenizer.apply_chat_template.assert_called()
-        call_kwargs = mock_tokenizer.apply_chat_template.call_args_list[0]
-        assert call_kwargs.kwargs.get("enable_thinking") is False
-        assert call_kwargs.kwargs.get("add_generation_prompt") is True
-
-        # Verify decode was called with skip_special_tokens=True
-        mock_tokenizer.decode.assert_called()
-        decode_kwargs = mock_tokenizer.decode.call_args_list[0]
-        assert decode_kwargs.kwargs.get("skip_special_tokens") is True
+        # Verify config
+        assert config["model"] == "test-model"
+        assert config["vllmBaseUrl"] == "http://localhost:8000/v1"
 
 
-def test_eval_loop_max_turns_reached():
-    """Verify loop terminates when max_turns reached even without submission."""
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.apply_chat_template.return_value = [1, 2, 3, 4, 5]
-    mock_tokenizer.decode.return_value = 'Let me think more...\n<tool_call>\n{"name": "eval", "arguments": {"code": "console.log(\'hi\')"}}\n</tool_call>'
-
-    mock_llm = _make_mock_llm(mock_tokenizer)
-    # Never terminates
-    mock_interaction = _make_mock_interaction(terminate_on_turn=999, reward=0.0)
-
+def test_eval_loop_subprocess_error():
+    """Verify graceful handling of agent-runner.ts subprocess failures."""
     from rl.eval_loop import evaluate_tasks
 
     tasks = [{"id": "test002", "task": SAMPLE_TASK}]
 
+    mock_result = MagicMock()
+    mock_result.returncode = 1
+    mock_result.stdout = b""
+    mock_result.stderr = b"Error: connection refused"
+
     with tempfile.TemporaryDirectory() as tmp, \
-         patch("rl.eval_loop.ArcInteraction", return_value=mock_interaction):
+         patch("rl.eval_loop.subprocess.run", return_value=mock_result):
         run_dir = os.path.join(tmp, "test-run")
+        os.makedirs(run_dir, exist_ok=True)
+
         evaluate_tasks(
             model_name="test-model",
             tasks=tasks,
-            system_prompt="You are an ARC solver.",
             run_dir=run_dir,
             run_name="test-run",
-            max_turns=3,
-            llm=mock_llm,
-            tokenizer=mock_tokenizer,
-            sampling_params=MagicMock(),
+            vllm_base_url="http://localhost:8000/v1",
         )
 
         with open(os.path.join(run_dir, "run.json")) as f:
             data = json.load(f)
 
         result = data["results"][0]
-        assert result["turns"] == 3
         assert result["correct"] is False
+        assert "connection refused" in result.get("error", "")
+
+
+def test_eval_loop_subprocess_timeout():
+    """Verify graceful handling of subprocess timeout."""
+    import subprocess as sp
+    from rl.eval_loop import evaluate_tasks
+
+    tasks = [{"id": "test003", "task": SAMPLE_TASK}]
+
+    with tempfile.TemporaryDirectory() as tmp, \
+         patch("rl.eval_loop.subprocess.run", side_effect=sp.TimeoutExpired(cmd="bun", timeout=300)):
+        run_dir = os.path.join(tmp, "test-run")
+        os.makedirs(run_dir, exist_ok=True)
+
+        evaluate_tasks(
+            model_name="test-model",
+            tasks=tasks,
+            run_dir=run_dir,
+            run_name="test-run",
+            vllm_base_url="http://localhost:8000/v1",
+        )
+
+        with open(os.path.join(run_dir, "run.json")) as f:
+            data = json.load(f)
+
+        result = data["results"][0]
+        assert result["correct"] is False
+        assert "timeout" in result.get("error", "").lower()
+
+
+def test_eval_loop_multiple_tasks():
+    """Verify the eval loop processes multiple tasks."""
+    from rl.eval_loop import evaluate_tasks
+
+    tasks = [
+        {"id": "task_a", "task": SAMPLE_TASK},
+        {"id": "task_b", "task": SAMPLE_TASK},
+        {"id": "task_c", "task": SAMPLE_TASK},
+    ]
+
+    call_count = {"n": 0}
+    correct_map = {"task_a": True, "task_b": False, "task_c": True}
+
+    def mock_run(cmd, **kwargs):
+        # Extract task_id from stdin JSON
+        input_data = json.loads(kwargs.get("input", b"{}"))
+        # Get task_id from cmd args
+        task_id = cmd[cmd.index("--task-id") + 1]
+        call_count["n"] += 1
+        return _mock_subprocess_result(task_id, correct=correct_map.get(task_id, False))
+
+    with tempfile.TemporaryDirectory() as tmp, \
+         patch("rl.eval_loop.subprocess.run", side_effect=mock_run):
+        run_dir = os.path.join(tmp, "test-run")
+        os.makedirs(run_dir, exist_ok=True)
+
+        evaluate_tasks(
+            model_name="test-model",
+            tasks=tasks,
+            run_dir=run_dir,
+            run_name="test-run",
+            vllm_base_url="http://localhost:8000/v1",
+        )
+
+        with open(os.path.join(run_dir, "run.json")) as f:
+            data = json.load(f)
+
+        assert len(data["results"]) == 3
+        assert data["summary"]["correct"] == 2
+        assert data["summary"]["total"] == 3
+        assert call_count["n"] == 3
