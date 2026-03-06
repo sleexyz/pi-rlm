@@ -2,19 +2,40 @@
 
 Uses the same components as the verl SDPO training loop:
 - vllm.LLM (in-process engine, not HTTP API)
-- AutoTokenizer with apply_chat_template(enable_thinking=False)
+- AutoTokenizer with apply_chat_template(tools=, enable_thinking=False)
 - ArcInteraction (same class as training)
 
-Zero code skew by design.
+Zero code skew by design. Uses tool call format (not code blocks).
 """
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 
 from .arc_data import _format_user_message
 from .arc_interaction import ArcInteraction
+from .parser import parse_tool_call
 from .trace_logger import TraceLogger, write_run_json
+
+# Tool definition for the eval REPL — passed to apply_chat_template
+EVAL_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "eval",
+        "description": "Execute JavaScript code in the sandboxed REPL. Variables persist across calls. Use console.log() to see output. Call submit(transform) when done.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "JavaScript code to execute",
+                },
+            },
+            "required": ["code"],
+        },
+    },
+}]
 
 
 def evaluate_tasks(
@@ -112,10 +133,17 @@ def evaluate_tasks(
                 # GENERATING: tokenize + generate + decode (matches verl exactly)
                 token_ids = tokenizer.apply_chat_template(
                     messages,
+                    tools=EVAL_TOOL,
                     add_generation_prompt=True,
                     tokenize=True,
                     enable_thinking=False,
                 )
+
+                # Guard: skip if conversation exceeds model context
+                if len(token_ids) > max_model_len:
+                    print(f"  [!] Context overflow ({len(token_ids)} > {max_model_len}), terminating task")
+                    break
+
                 outputs = llm.generate(
                     [{"prompt_token_ids": token_ids}],
                     sampling_params=sampling_params,
@@ -124,9 +152,29 @@ def evaluate_tasks(
                 text = tokenizer.decode(output_ids, skip_special_tokens=True)
                 total_tokens += len(token_ids) + len(output_ids)
 
-                # Log assistant message
-                trace.log_message("assistant", [{"type": "text", "text": text}])
-                messages.append({"role": "assistant", "content": text})
+                # Parse tool call from model output
+                code = parse_tool_call(text)
+                if code:
+                    # Log as structured tool_use content block
+                    # Extract any text before the <tool_call> tag
+                    tc_idx = text.find("<tool_call>")
+                    preamble = text[:tc_idx].strip() if tc_idx > 0 else ""
+                    content_blocks = []
+                    if preamble:
+                        content_blocks.append({"type": "text", "text": preamble})
+                    content_blocks.append({"type": "tool_use", "name": "eval", "arguments": {"code": code}})
+                    trace.log_message("assistant", content_blocks)
+
+                    # Build tool_calls message for chat template
+                    messages.append({
+                        "role": "assistant",
+                        "content": preamble,
+                        "tool_calls": [{"type": "function", "function": {"name": "eval", "arguments": json.dumps({"code": code})}}],
+                    })
+                else:
+                    # No tool call — log raw text
+                    trace.log_message("assistant", text)
+                    messages.append({"role": "assistant", "content": text})
 
                 # INTERACTING: call interaction (same as verl)
                 should_terminate, feedback, rwd, metrics = loop.run_until_complete(
@@ -134,15 +182,16 @@ def evaluate_tasks(
                 )
                 turns += 1
 
-                # Log feedback
-                trace.log_message("user", feedback)
+                # Log feedback as tool result
+                trace.log_message("tool", feedback)
 
                 if should_terminate:
                     reward = rwd
                     submitted = metrics.get("submitted", False)
                     break
 
-                messages.append({"role": "user", "content": feedback})
+                # Tool result message for chat template
+                messages.append({"role": "tool", "name": "eval", "content": feedback})
 
             # Finalize
             loop.run_until_complete(interaction.finalize_interaction(task_id))

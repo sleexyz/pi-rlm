@@ -15,7 +15,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from .js_sandbox import SandboxPool
-from .parser import parse_code_blocks
+from .parser import parse_tool_call
 
 
 class ArcInteraction:
@@ -78,36 +78,22 @@ class ArcInteraction:
                 content = messages[i].get("content", "")
                 break
 
-        # Parse code blocks
-        segments = parse_code_blocks(content)
-        code_blocks = [s for s in segments if s["type"] == "code"]
+        # Extract code from tool call
+        code = parse_tool_call(content)
 
-        if not code_blocks:
-            return False, "No code blocks found. Write a ```js code block to execute code.", 0.0, {"submitted": False}
+        if not code:
+            return False, "No code found. Use the eval tool to execute JavaScript code.", 0.0, {"submitted": False}
 
-        # Execute each code block
+        # Execute code
         session = self.pool.get_or_create(instance_id, meta["task"])
-        last_result = None
-        feedbacks = []
+        result = session.eval(code)
 
-        for block in code_blocks:
-            code = block["content"]
-            result = session.eval(code)
-            last_result = result
-
-            # Format feedback matching toolResultToUserMessage from pi-rlm
-            output = result.get("stdout", "") or ""
-            if result.get("error"):
-                output = result["error"] if not output else f"{output}\n\nError: {result['error']}"
-            feedback = f"Code executed:\n```js\n{code}\n```\n\nREPL output:\n{output or '(no output)'}"
-            feedbacks.append(feedback)
-
-            # Stop executing more blocks if submitted
-            if result.get("submitted") is not None:
-                break
-
-        combined_feedback = "\n\n".join(feedbacks)
-        submitted = last_result.get("submitted") if last_result else None
+        # Format feedback
+        output = result.get("stdout", "") or ""
+        if result.get("error"):
+            output = result["error"] if not output else f"{output}\n\nError: {result['error']}"
+        combined_feedback = output or "(no output)"
+        submitted = result.get("submitted")
 
         # Compute reward
         reward = 0.0

@@ -1,0 +1,182 @@
+{
+  "name": "rlm-qwen3-8b-v0.1_ARC-AGI-1_training_10_20260306_061631",
+  "startedAt": "2026-03-06T06:19:52.254494+00:00",
+  "config": {
+    "model": "mit-oasys/rlm-qwen3-8b-v0.1",
+    "split": "eval",
+    "maxTurns": 15,
+    "temperature": 0.6,
+    "topP": 0.95,
+    "maxTokens": 8192,
+    "startedAt": "2026-03-06T06:19:52.254494+00:00"
+  },
+  "results": [
+    {
+      "taskId": "007bbfb7",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 35994,
+          "timeMs": 111162
+        }
+      ],
+      "tokens": 35994,
+      "timeMs": 111162,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 3
+    },
+    {
+      "taskId": "00d62c1b",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 82793,
+          "timeMs": 201332
+        }
+      ],
+      "tokens": 82793,
+      "timeMs": 201332,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 4
+    },
+    {
+      "taskId": "017c7c7b",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 58232,
+          "timeMs": 232905
+        }
+      ],
+      "tokens": 58232,
+      "timeMs": 232905,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 4
+    },
+    {
+      "taskId": "025d127b",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 282513,
+          "timeMs": 227743
+        }
+      ],
+      "tokens": 282513,
+      "timeMs": 227743,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 12
+    },
+    {
+      "taskId": "045e512c",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 42085,
+          "timeMs": 203951
+        }
+      ],
+      "tokens": 42085,
+      "timeMs": 203951,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 2
+    },
+    {
+      "taskId": "0520fde7",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 142446,
+          "timeMs": 190978
+        }
+      ],
+      "tokens": 142446,
+      "timeMs": 190978,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 7
+    },
+    {
+      "taskId": "05269061",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 147035,
+          "timeMs": 226642
+        }
+      ],
+      "tokens": 147035,
+      "timeMs": 226642,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 7
+    },
+    {
+      "taskId": "05f2a901",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 131223,
+          "timeMs": 223315
+        }
+      ],
+      "tokens": 131223,
+      "timeMs": 223315,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 6
+    },
+    {
+      "taskId": "06df4c85",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 176878,
+          "timeMs": 157997
+        }
+      ],
+      "tokens": 176878,
+      "timeMs": 157997,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 7
+    },
+    {
+      "taskId": "08ed6ac7",
+      "correct": false,
+      "attempts": [
+        {
+          "correct": false,
+          "tokens": 208181,
+          "timeMs": 204830
+        }
+      ],
+      "tokens": 208181,
+      "timeMs": 204830,
+      "reward": 0.0,
+      "submitted": false,
+      "turns": 10
+    }
+  ],
+  "summary": {
+    "correct": 0,
+    "total": 10,
+    "pct": 0.0,
+    "tokens": 1307380,
+    "timeMs": 1980855
+  }
+}

@@ -1,4 +1,4 @@
-"""Gate 3 — 6 tests for ArcInteraction."""
+"""Tests for ArcInteraction with tool call format."""
 
 import asyncio
 import pytest
@@ -10,6 +10,12 @@ TASK = {
 }
 
 
+def _tool_call(code: str) -> str:
+    """Format code as a tool call string (what the model would output)."""
+    import json
+    return f'<tool_call>\n{json.dumps({"name": "eval", "arguments": {"code": code}})}\n</tool_call>'
+
+
 def run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -17,7 +23,7 @@ def run(coro):
 def test_correct_submission():
     interaction = ArcInteraction(tasks={"task0": TASK})
     messages = [
-        {"role": "assistant", "content": "```js\nsubmit([[5,6,5,6],[7,8,7,8]])\n```"}
+        {"role": "assistant", "content": _tool_call("submit([[5,6,5,6],[7,8,7,8]])")}
     ]
     terminated, feedback, reward, metrics = run(
         interaction.generate_response("task0", messages)
@@ -31,7 +37,7 @@ def test_correct_submission():
 def test_incorrect_submission():
     interaction = ArcInteraction(tasks={"task0": TASK})
     messages = [
-        {"role": "assistant", "content": "```js\nsubmit([[0,0],[0,0]])\n```"}
+        {"role": "assistant", "content": _tool_call("submit([[0,0],[0,0]])")}
     ]
     terminated, feedback, reward, metrics = run(
         interaction.generate_response("task0", messages)
@@ -44,18 +50,17 @@ def test_incorrect_submission():
 def test_no_submission_continues():
     interaction = ArcInteraction(tasks={"task0": TASK})
     messages = [
-        {"role": "assistant", "content": "```js\nconsole.log(trainingExamples[0])\n```"}
+        {"role": "assistant", "content": _tool_call("console.log(trainingExamples[0])")}
     ]
     terminated, feedback, reward, metrics = run(
         interaction.generate_response("task0", messages)
     )
     assert terminated is False
     assert reward == 0.0
-    assert "REPL output" in feedback
     interaction.pool.close_all()
 
 
-def test_no_code_blocks():
+def test_no_tool_call():
     interaction = ArcInteraction(tasks={"task0": TASK})
     messages = [
         {"role": "assistant", "content": "Let me think about this..."}
@@ -73,12 +78,12 @@ def test_variable_persistence_across_turns():
     interaction = ArcInteraction(tasks={"task0": TASK})
     # Turn 1: define variable
     msgs1 = [
-        {"role": "assistant", "content": "```js\nconst grid = trainingExamples[0].input\n```"}
+        {"role": "assistant", "content": _tool_call("const grid = trainingExamples[0].input")}
     ]
     run(interaction.generate_response("task0", msgs1))
     # Turn 2: use variable from turn 1
     msgs2 = [
-        {"role": "assistant", "content": "```js\nconsole.log(JSON.stringify(grid))\n```"}
+        {"role": "assistant", "content": _tool_call("console.log(JSON.stringify(grid))")}
     ]
     _, feedback, _, _ = run(interaction.generate_response("task0", msgs2))
     assert "[[1,2],[3,4]]" in feedback
@@ -88,7 +93,7 @@ def test_variable_persistence_across_turns():
 def test_syntax_error():
     interaction = ArcInteraction(tasks={"task0": TASK})
     messages = [
-        {"role": "assistant", "content": "```js\nfunction(\n```"}
+        {"role": "assistant", "content": _tool_call("function(")}
     ]
     terminated, feedback, reward, metrics = run(
         interaction.generate_response("task0", messages)

@@ -29,7 +29,7 @@ class TraceLogger:
         self._f.write(json.dumps(header) + "\n")
 
     def log_message(self, role: str, content: str | list):
-        """Log a message. Assistant content should be [{"type":"text","text":"..."}]."""
+        """Log a message. Content is either a string or structured content blocks."""
         entry = {
             "type": "message",
             "ts": int(time.time()),

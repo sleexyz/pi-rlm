@@ -42,7 +42,7 @@ def _make_mock_interaction(terminate_on_turn=2, reward=1.0):
         call_count["n"] += 1
         if call_count["n"] >= terminate_on_turn:
             return True, "Submitted. Reward: 1.0", reward, {"submitted": True}
-        return False, "Code executed:\n```js\nconsole.log('hi')\n```\n\nREPL output:\nhi", 0.0, {"submitted": False}
+        return False, "hi", 0.0, {"submitted": False}
 
     async def mock_finalize(instance_id, **kwargs):
         pass
@@ -63,9 +63,9 @@ def test_eval_loop_single_task():
     def decode_side_effect(ids, skip_special_tokens=True):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return "Let me analyze...\n```js\nfunction transform(grid) { return grid.map(r => r.map(() => 1)); }\n```"
+            return 'Let me analyze...\n<tool_call>\n{"name": "eval", "arguments": {"code": "function transform(grid) { return grid.map(r => r.map(() => 1)); }"}}\n</tool_call>'
         else:
-            return "```js\nsubmit(transform)\n```"
+            return '<tool_call>\n{"name": "eval", "arguments": {"code": "submit(transform)"}}\n</tool_call>'
 
     mock_tokenizer.decode.side_effect = decode_side_effect
 
@@ -133,7 +133,7 @@ def test_eval_loop_max_turns_reached():
     """Verify loop terminates when max_turns reached even without submission."""
     mock_tokenizer = MagicMock()
     mock_tokenizer.apply_chat_template.return_value = [1, 2, 3, 4, 5]
-    mock_tokenizer.decode.return_value = "Let me think more...\n```js\nconsole.log('hi')\n```"
+    mock_tokenizer.decode.return_value = 'Let me think more...\n<tool_call>\n{"name": "eval", "arguments": {"code": "console.log(\'hi\')"}}\n</tool_call>'
 
     mock_llm = _make_mock_llm(mock_tokenizer)
     # Never terminates
