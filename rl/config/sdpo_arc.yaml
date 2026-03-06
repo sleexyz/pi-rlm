@@ -1,0 +1,95 @@
+# SDPO config for ARC-AGI-2 multi-turn training
+# Placed in verl/trainer/config/ alongside ppo_trainer.yaml
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Reduced from LCB defaults due to longer multi-turn sequences
+max_model_len: 32768
+
+data:
+  train_batch_size: 8
+  train_files: ["${oc.env:ARC_DATA_DIR}/train.parquet"]
+  val_files: ["${oc.env:ARC_DATA_DIR}/test.parquet"]
+  max_prompt_length: 4096
+  max_response_length: 8192
+  filter_overlong_prompts: True
+  return_raw_chat: True
+  shuffle: True
+  trust_remote_code: True
+  apply_chat_template_kwargs: {"enable_thinking": false}
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 1
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: ${max_model_len}
+    clip_ratio_high: 0.28
+    use_kl_loss: False
+    policy_loss:
+      loss_mode: sdpo
+    self_distillation:
+      max_reprompt_len: 32768
+      is_clip: 2.0
+      distillation_topk: 100
+      dont_reprompt_on_self_success: True
+      alpha: 1.0
+      teacher_update_rate: 0.01
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: 0
+  model:
+    path: Qwen/Qwen3-8B
+    trust_remote_code: True
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    n: 4
+    calculate_log_probs: True
+    gpu_memory_utilization: 0.55
+    log_prob_micro_batch_size_per_gpu: 1
+    max_num_batched_tokens: ${max_model_len}
+    max_model_len: ${max_model_len}
+    multi_turn:
+      enable: True
+      max_user_turns: 15
+      max_assistant_turns: 15
+      interaction_config_path: null  # Set at launch time
+    val_kwargs:
+      top_p: 0.95
+      temperature: 0.6
+      n: 4
+      do_sample: True
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  use_kl_in_reward: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+custom_reward_function:
+  path: /app/rl/arc_reward.py
+
+critic:
+  model:
+    path: Qwen/Qwen3-8B
+
+reward_model:
+  use_reward_loop: False
+
+trainer:
+  project_name: SDPO-ARC
+  group_name: sdpo-arc-multiturn
+  experiment_name: sdpo-arc-qwen3-8b
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: 5
+  test_freq: 3
+  max_actor_ckpt_to_keep: 2
+  total_epochs: 30
+  val_before_train: False
+  logger: ["console", "wandb"]

@@ -1,0 +1,4 @@
+interaction:
+  - name: "arc"
+    class_name: "rl.arc_interaction.ArcInteraction"
+    config: {}

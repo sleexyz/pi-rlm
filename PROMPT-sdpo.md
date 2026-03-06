@@ -59,15 +59,27 @@
 
 ## State
 
-**Progress:** Not started.
+**Progress:** Phases 1-3 COMPLETE (21/21 tests pass). Phase 4-5 code written but untested on Modal. Resuming from Gate 4a.
+
+**What exists (from prior ralph run):**
+- `domains/arc-agi-2/src/sandbox-server.ts` — long-lived TS process, reuses EvalRuntime + createArcAdapter. WORKING.
+- `domains/arc-agi-2/src/generate-prompt.ts` — one-shot prompt generator for data prep. UNTESTED.
+- `rl/js_sandbox.py` — SandboxSession + SandboxPool. 9/9 tests pass.
+- `rl/parser.py` — port of parseReplBlocks. 6/6 tests pass.
+- `rl/arc_interaction.py` — verl Interaction impl. 6/6 tests pass (including variable persistence).
+- `rl/arc_reward.py` — reward computation helper.
+- `rl/arc_data.py` — ARC data loader + parquet generation. UNTESTED.
+- `rl/modal_app.py` — Modal deployment. UNTESTED.
+- `rl/config/sdpo_arc.yaml` — verl config for ARC. UNTESTED.
+- `rl/tests/` — 21 tests, all passing.
+- `rl/.venv/`, `rl/pyproject.toml`, `rl/uv.lock` — Python project setup.
 
 **Current understanding:**
-- verl's tool_agent_loop already does multi-turn: GENERATING → PROCESSING_TOOLS → INTERACTING → repeat
-- We need an `ArcInteraction` that delegates code execution to the existing TS stack
-- The TS execution stack (EvalRuntime + createArcAdapter) must be reused — not reimplemented — to guarantee training/eval consistency
-- EvalRuntime has persistent context (variables survive across eval calls within a rollout) — this requires a long-lived subprocess, not per-call invocation
-- The SDPO loss, teacher, rollout correction are all handled by verl
-- sdpo_modal.py gives us the Modal deployment pattern
+- Local code is solid — sandbox-server, parser, ArcInteraction all work with correct variable persistence
+- The remaining work is integration: does arc_data.py produce valid parquet? Does the config load in Hydra? Does Modal deploy correctly?
+- These require iterative debugging with real Modal access
+
+**STOP POINT: Do NOT proceed past Gate 5b.** Complete through the 2-step smoke test, then stop.
 
 ---
 
@@ -86,231 +98,36 @@
 
 Each phase has a **GATE** — a concrete, runnable verification. Do NOT proceed past a gate until it passes.
 
-### Phase 1: Sandbox Server + Python Wrapper
+### Phase 1: Sandbox Server + Python Wrapper — COMPLETE
 
-The foundation — everything depends on correct code execution with zero skew from pi-rlm.
+All code exists and tests pass. 9/9 sandbox tests, variable persistence confirmed.
 
-#### 1a. Sandbox Server (`domains/arc-agi-2/src/sandbox-server.ts`)
+- [x] `domains/arc-agi-2/src/sandbox-server.ts` — EvalRuntime + createArcAdapter, JSON-line protocol
+- [x] `rl/js_sandbox.py` — SandboxSession + SandboxPool, subprocess management
 
-A long-lived process that wraps `EvalRuntime` + `createArcAdapter()`. JSON-line protocol over stdin/stdout.
+**GATE 1 PASSED** — `cd rl && .venv/bin/python -m pytest tests/test_js_sandbox.py -v` — 9/9 pass.
 
-- [ ] Import `EvalRuntime` from `pi-rlm/src/eval-runtime.ts`
-- [ ] Import `createArcAdapter` from `./adapter.ts`
-- [ ] On `{"type":"init","task":{...}}`: create adapter via `createArcAdapter(task)`, create `EvalRuntime` with adapter scope + `submit()` function
-- [ ] On `{"type":"eval","code":"..."}`: call `runtime.eval(code)`, return `{"type":"result","stdout":"...","stderr":"...","returnValue":...,"error":...,"submitted":...}`
-- [ ] `submit()` sets a flag + stores the value, included in the result JSON
-- [ ] On `{"type":"shutdown"}`: exit cleanly
-- [ ] Read from stdin line-by-line, write JSON-line responses to stdout
+### Phase 2: Code-Block Parser — COMPLETE
 
-#### 1b. Python Sandbox Wrapper (`rl/js_sandbox.py`)
+- [x] `rl/parser.py` — port of parseReplBlocks, 6/6 tests pass
 
-Manages long-lived `bun` subprocesses — one per rollout instance.
+**GATE 2 PASSED** — `cd rl && .venv/bin/python -m pytest tests/test_parser.py -v` — 6/6 pass.
 
-- [ ] `class SandboxSession`: wraps a single `bun` subprocess
-  - `__init__(task: dict)`: starts `bun run domains/arc-agi-2/src/sandbox-server.ts`, sends `init` command with task
-  - `eval(code: str) -> dict`: sends `eval` command, reads result JSON
-  - `close()`: sends `shutdown`, kills process
-- [ ] `class SandboxPool`: manages multiple sessions by instance_id
-  - `get_or_create(instance_id: str, task: dict) -> SandboxSession`
-  - `close_all()`
-- [ ] Timeout handling: if `eval` doesn't return within N seconds, kill and restart subprocess
-- [ ] Error handling: if subprocess dies, return error result
+### Phase 3: ARC Interaction — COMPLETE
 
-**GATE 1 — `rl/tests/test_js_sandbox.py` (9 tests):**
-```python
-TASK = {
-    "train": [{"input": [[1,2],[3,4]], "output": [[1,2,1,2],[3,4,3,4]]}],
-    "test": [{"input": [[5,6],[7,8]], "output": [[5,6,5,6],[7,8,7,8]]}],
-}
+- [x] `rl/arc_interaction.py` — verl Interaction impl with variable persistence, 6/6 tests pass
 
-def test_console_log():
-    s = SandboxSession(TASK)
-    r = s.eval('console.log("hello")')
-    assert r["stdout"].strip() == "hello"
-    assert r["error"] is None
-    s.close()
-
-def test_accuracy_match():
-    s = SandboxSession(TASK)
-    r = s.eval('console.log(accuracy([[1,2],[3,4]], [[1,2],[3,4]]))')
-    assert "1" in r["stdout"]
-    s.close()
-
-def test_accuracy_mismatch():
-    s = SandboxSession(TASK)
-    r = s.eval('console.log(accuracy([[1,2],[3,4]], [[9,9],[9,9]]))')
-    assert "0" in r["stdout"]
-    s.close()
-
-def test_rotate90():
-    s = SandboxSession(TASK)
-    r = s.eval('console.log(JSON.stringify(rotate90([[1,2],[3,4]])))')
-    assert json.loads(r["stdout"].strip()) == [[3,1],[4,2]]
-    s.close()
-
-def test_connected_components():
-    s = SandboxSession(TASK)
-    r = s.eval('''
-    const grid = [[1,0,1],[0,0,0],[1,0,1]];
-    const comps = connectedComponents(grid);
-    console.log(comps.length);
-    ''')
-    assert r["stdout"].strip() == "4"
-    s.close()
-
-def test_training_examples_available():
-    s = SandboxSession(TASK)
-    r = s.eval('console.log(trainingExamples.length)')
-    assert r["stdout"].strip() == "1"
-    s.close()
-
-def test_submit_detection():
-    s = SandboxSession(TASK)
-    r = s.eval('submit([[5,6,5,6],[7,8,7,8]])')
-    assert r["submitted"] == [[5,6,5,6],[7,8,7,8]]
-    s.close()
-
-def test_variable_persistence():
-    """Variables must persist across eval calls — same as pi-rlm's EvalRuntime."""
-    s = SandboxSession(TASK)
-    s.eval('const grid = trainingExamples[0].input')
-    r = s.eval('console.log(JSON.stringify(grid))')
-    assert json.loads(r["stdout"].strip()) == [[1,2],[3,4]]
-    s.close()
-
-def test_error_handling():
-    s = SandboxSession(TASK)
-    r = s.eval('throw new Error("boom")')
-    assert r["error"] is not None
-    assert "boom" in r["error"]
-    s.close()
-```
-Run: `cd rl && python -m pytest tests/test_js_sandbox.py -v` — all 9 pass.
-
-### Phase 2: Code-Block Parser
-
-#### 2a. Parser (`rl/parser.py`)
-- [ ] `parse_code_blocks(text: str) -> list[dict]` — port of `parseReplBlocks` from `pi-rlm/src/repl-stream.ts`
-- [ ] Returns `[{"type": "text", "content": str} | {"type": "code", "content": str}, ...]`
-- [ ] Must match the regex from `parseReplBlocks`: ` ```(?:repl|js)\s*\n(.*?)\n``` `
-
-**GATE 2 — `rl/tests/test_parser.py` (6 tests):**
-```python
-def test_single_block():
-    segs = parse_code_blocks("Text\n```js\ncode()\n```\nMore")
-    assert segs == [
-        {"type": "text", "content": "Text"},
-        {"type": "code", "content": "code()"},
-        {"type": "text", "content": "More"},
-    ]
-
-def test_ignores_non_js():
-    segs = parse_code_blocks('```python\nno\n```\n```js\nyes\n```')
-    code = [s for s in segs if s["type"] == "code"]
-    assert len(code) == 1 and code[0]["content"] == "yes"
-
-def test_multiple():
-    segs = parse_code_blocks("A\n```js\n1\n```\nB\n```js\n2\n```")
-    code = [s for s in segs if s["type"] == "code"]
-    assert len(code) == 2
-
-def test_empty():
-    assert parse_code_blocks("") == []
-
-def test_no_blocks():
-    assert parse_code_blocks("Just text") == [{"type": "text", "content": "Just text"}]
-
-def test_whitespace_stripped():
-    segs = parse_code_blocks("\n\n```js\nx = 1\n```\n\n")
-    assert segs == [{"type": "code", "content": "x = 1"}]
-```
-Run: `cd rl && python -m pytest tests/test_parser.py -v` — all 6 pass.
-
-### Phase 3: ARC Interaction
-
-The bridge between verl's rollout engine and the TS execution environment.
-
-#### 3a. Read verl's Interaction Interface
-- [ ] Read `~/projects/kirby/downloads/SDPO/verl/interactions/base.py` — understand the interface contract
-- [ ] Read `~/projects/kirby/downloads/SDPO/verl/interactions/gsm8k_interaction.py` — understand a working example
-- [ ] Read `~/projects/kirby/downloads/SDPO/verl/experimental/agent_loop/tool_agent_loop.py` — understand how the state machine calls interactions
-
-#### 3b. ArcInteraction (`rl/arc_interaction.py`)
-- [ ] Subclass verl's `Interaction`
-- [ ] Owns a `SandboxPool` for managing per-instance TS subprocesses
-- [ ] `generate_response(instance_id, messages, **kwargs)`:
-  1. Extract latest assistant message
-  2. Parse ```js code blocks via `parse_code_blocks()`
-  3. Execute each code block via `SandboxPool.get_or_create(instance_id, task).eval(code)`
-  4. Compute reward: 1.0 if submitted and accuracy == 1.0, else 0.0
-  5. Format feedback matching `toolResultToUserMessage`: `"Code executed:\n```js\n{code}\n```\n\nREPL output:\n{output or '(no output)'}"`
-  6. should_terminate = submitted or turn >= max_turns
-  7. Return `(should_terminate, feedback, reward, {"accuracy": reward, "submitted": submitted is not None})`
-- [ ] Handle edge cases: no code blocks in response, sandbox errors, timeout
-- [ ] Cleanup: close sandbox sessions when rollout completes
-
-**GATE 3 — `rl/tests/test_arc_interaction.py`:**
-```python
-def test_correct_submission():
-    interaction = ArcInteraction(tasks={"task0": TASK})
-    messages = [{"role": "assistant", "content": "```js\nsubmit([[5,6,5,6],[7,8,7,8]])\n```"}]
-    terminated, feedback, reward, metrics = interaction.generate_response("task0", messages)
-    assert terminated == True
-    assert reward == 1.0
-    assert metrics["submitted"] == True
-
-def test_incorrect_submission():
-    interaction = ArcInteraction(tasks={"task0": TASK})
-    messages = [{"role": "assistant", "content": "```js\nsubmit([[0,0],[0,0]])\n```"}]
-    terminated, feedback, reward, metrics = interaction.generate_response("task0", messages)
-    assert terminated == True
-    assert reward == 0.0
-
-def test_no_submission_continues():
-    interaction = ArcInteraction(tasks={"task0": TASK})
-    messages = [{"role": "assistant", "content": "```js\nconsole.log(trainingExamples[0])\n```"}]
-    terminated, feedback, reward, metrics = interaction.generate_response("task0", messages)
-    assert terminated == False
-    assert reward == 0.0
-    assert "REPL output" in feedback
-
-def test_no_code_blocks():
-    interaction = ArcInteraction(tasks={"task0": TASK})
-    messages = [{"role": "assistant", "content": "Let me think about this..."}]
-    terminated, feedback, reward, metrics = interaction.generate_response("task0", messages)
-    assert terminated == False
-    assert reward == 0.0
-
-def test_variable_persistence_across_turns():
-    """Multi-turn: variables from turn 1 available in turn 2."""
-    interaction = ArcInteraction(tasks={"task0": TASK})
-    # Turn 1: define variable
-    msgs1 = [{"role": "assistant", "content": "```js\nconst grid = trainingExamples[0].input\n```"}]
-    interaction.generate_response("task0", msgs1)
-    # Turn 2: use variable from turn 1
-    msgs2 = [{"role": "assistant", "content": "```js\nconsole.log(JSON.stringify(grid))\n```"}]
-    _, feedback, _, _ = interaction.generate_response("task0", msgs2)
-    assert "[[1,2],[3,4]]" in feedback
-
-def test_syntax_error():
-    interaction = ArcInteraction(tasks={"task0": TASK})
-    messages = [{"role": "assistant", "content": "```js\nfunction(\n```"}]
-    terminated, feedback, reward, metrics = interaction.generate_response("task0", messages)
-    assert terminated == False
-    assert "error" in feedback.lower() or "Error" in feedback
-```
-Run: `cd rl && python -m pytest tests/test_arc_interaction.py -v` — all 6 pass.
+**GATE 3 PASSED** — `cd rl && .venv/bin/python -m pytest tests/test_arc_interaction.py -v` — 6/6 pass.
 
 ### Phase 4: ARC Data + verl Config
 
+Code exists from prior run but is UNTESTED. Verify and fix.
+
 #### 4a. ARC Data Loader (`rl/arc_data.py`)
 
-System prompt is generated by calling the existing TS functions — NOT ported to Python.
-
-- [ ] `load_arc_tasks(split, data_dir) -> list[dict]`
-- [ ] `generate_prompt_via_ts(task: dict) -> str` — calls `bun` one-shot to run `generateCodeBlockSystemPrompt(createArcAdapter(task))`. Write a small TS script (`domains/arc-agi-2/src/generate-prompt.ts`) that reads task JSON from stdin and prints the system prompt.
-- [ ] `prepare_verl_dataset(tasks) -> parquet` — convert to verl's expected format
-- [ ] Read how kirby's `data/preprocess.py` creates the parquet files verl expects
+- [ ] Run `generate-prompt.ts` standalone to verify it produces valid prompts
+- [ ] Test `arc_data.py` locally: load 5 tasks, generate parquet, verify contents
+- [ ] Read how kirby's `data/preprocess.py` creates the parquet files verl expects — verify our format matches
 
 **GATE 4a:**
 ```python
@@ -348,17 +165,12 @@ print('model:', cfg.actor_rollout_ref.model.path)
 
 ### Phase 5: Modal Deployment
 
+`rl/modal_app.py` exists from prior run but is UNTESTED. Verify and fix iteratively.
+
 #### 5a. Modal App (`rl/modal_app.py`)
-- [ ] Adapt from `~/projects/kirby/sdpo_modal.py`
-- [ ] Same image base (`verlai/verl:vllm011.latest`)
-- [ ] Add Bun to image: `curl -fsSL https://bun.sh/install | bash`
-- [ ] Copy TS source files into image: `pi-rlm/src/`, `domains/arc-agi-2/src/` (needed by sandbox-server.ts)
-- [ ] Run `bun install` in image for pi-rlm dependencies (EvalRuntime uses `node:vm`, no npm deps needed)
-- [ ] Add `rl/` Python code to image
-- [ ] Mount ARC data to volume
-- [ ] `prep_data()` function: load ARC tasks, generate prompts via TS, create parquet
-- [ ] `train()` function: launch verl training with SDPO + ARC config
-- [ ] `serve()` function: start vLLM for external evaluation
+- [ ] Review modal_app.py — verify it includes Bun install, TS source file mounts, ARC data
+- [ ] Fix any issues found during review
+- [ ] Verify `bun --version` works inside the Modal image
 
 **GATE 5a — prep_data runs on Modal:**
 ```bash
@@ -377,18 +189,13 @@ modal run rl/modal_app.py::train -- trainer.total_epochs=2 data.train_batch_size
 - No `DIVERGENCE` or `NaN` in output
 - Evaluation ran at step 1
 
-#### 5c. Full Training Run
-```bash
-modal run --detach rl/modal_app.py::train
-```
+**STOP HERE after Gate 5b passes. Do NOT proceed to 5c or Phase 6. Commit all work and report status.**
 
-**GATE 5c:** After 30 epochs, WandB shows:
-- `train/loss` — all finite, no NaN
-- `train/kl_positive_frac` — stays in [0.2, 0.8]
-- `eval/pass_at_1` logged at expected intervals
-- No divergence
+When Gate 5b passes: `<promise>COMPLETE</promise>`
 
-### Phase 6: Evaluation
+#### 5c. Full Training Run (FUTURE — do not run)
+
+### Phase 6: Evaluation (FUTURE — do not run)
 
 #### 6a. Serve Trained Model
 ```bash
