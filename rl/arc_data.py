@@ -63,12 +63,13 @@ def prepare_verl_dataset(tasks: list[dict]) -> "pandas.DataFrame":
     """
     import pandas as pd
 
+    # System prompt is task-independent — generate once
+    system_prompt = generate_prompt_via_ts(tasks[0]["task"])
+
     rows = []
     for item in tasks:
         task_id = item["id"]
         task = item["task"]
-
-        system_prompt = generate_prompt_via_ts(task)
 
         # User message: present the task data
         user_msg = _format_user_message(task)
@@ -130,13 +131,46 @@ def _grid_to_str(grid: list[list[int]]) -> str:
     return "\n".join(" ".join(str(c) for c in row) for row in grid)
 
 
+def _to_large(field: "pyarrow.Field") -> "pyarrow.Field":
+    """Convert Arrow field to large types (avoids 32-bit offset overflow)."""
+    import pyarrow as pa
+    t = field.type
+    if pa.types.is_string(t):
+        return pa.field(field.name, pa.large_string(), field.nullable, field.metadata)
+    if pa.types.is_binary(t):
+        return pa.field(field.name, pa.large_binary(), field.nullable, field.metadata)
+    if pa.types.is_list(t):
+        return pa.field(field.name, pa.large_list(_to_large(pa.field("item", t.value_type)).type),
+                        field.nullable, field.metadata)
+    if pa.types.is_struct(t):
+        return pa.field(field.name,
+            pa.struct([_to_large(pa.field(f.name, f.type, f.nullable, f.metadata)) for f in t]),
+            field.nullable, field.metadata)
+    return field
+
+
 def save_parquet(df: "pandas.DataFrame", path: str):
-    """Save DataFrame to parquet with verl-compatible settings."""
+    """Save DataFrame to parquet with verl-compatible settings.
+
+    Uses LargeString/LargeList types and small row groups to match
+    kirby's preprocess.py format (avoids 32-bit offset overflow).
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     table = pa.Table.from_pandas(df)
-    pq.write_table(table, path, compression="zstd")
+    large_schema = pa.schema([_to_large(pa.field(f.name, f.type, f.nullable, f.metadata)) for f in table.schema])
+    table = table.cast(large_schema)
+    writer = None
+    try:
+        for start in range(0, len(table), 32):
+            chunk = table.slice(start, min(32, len(table) - start))
+            if writer is None:
+                writer = pq.ParquetWriter(path, chunk.schema, compression="zstd")
+            writer.write_table(chunk)
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 if __name__ == "__main__":
