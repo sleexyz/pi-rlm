@@ -67,6 +67,8 @@ image = (
     # Copy TS source files — must match js_sandbox.py's PROJECT_ROOT layout (/app/)
     .add_local_dir("pi-rlm/src", "/app/pi-rlm/src", copy=True)
     .add_local_dir("domains/arc-agi-2/src", "/app/domains/arc-agi-2/src", copy=True)
+    .add_local_dir("domains/arc-agi-2/viewer", "/app/domains/arc-agi-2/viewer", copy=True)
+    .run_commands("cd /app/domains/arc-agi-2 && /root/.bun/bin/bun add ws")
     # Copy Python RL code (exclude venv/cache)
     .add_local_file("rl/__init__.py", f"{RL_DIR}/__init__.py", copy=True)
     .add_local_file("rl/parser.py", f"{RL_DIR}/parser.py", copy=True)
@@ -337,6 +339,41 @@ def pack_run(run_name: str = ""):
     print(f"\nDownload with:")
     print(f"  modal volume get sdpo-arc-data eval-runs/{run_name}/run.tar.gz runs/{run_name}/run.tar.gz")
     print(f"  cd runs/{run_name} && tar xzf run.tar.gz")
+
+
+@app.function(
+    image=image,
+    volumes={DATA_PATH: data_volume},
+    min_containers=1,
+    cpu=2,
+    memory=2048,
+)
+@modal.concurrent(max_inputs=100)
+@modal.web_server(port=3334, startup_timeout=30)
+def viewer():
+    """Live trace viewer — streams eval traces via WebSocket."""
+    import threading
+    import time
+
+    proc = subprocess.Popen(
+        ["/root/.bun/bin/bun", "run", "/app/domains/arc-agi-2/src/viewer.ts"],
+        env={
+            **os.environ,
+            "VIEWER_RUNS_ROOT": f"{DATA_PATH}/eval-runs",
+            "PORT": "3334",
+        },
+    )
+
+    # Periodic volume reload so we see writes from eval shard containers
+    def reload_loop():
+        while proc.poll() is None:
+            try:
+                data_volume.reload()
+            except Exception:
+                pass
+            time.sleep(5)
+
+    threading.Thread(target=reload_loop, daemon=True).start()
 
 
 @app.local_entrypoint()

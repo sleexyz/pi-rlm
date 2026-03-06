@@ -22,7 +22,7 @@ const port = portIdx !== -1 && args[portIdx + 1]
 	: process.env.PORT ? parseInt(process.env.PORT, 10) : 3334;
 
 const repoRoot = join(import.meta.dirname, "../../..");
-const RUNS_ROOT = join(repoRoot, "runs");
+const RUNS_ROOT = process.env.VIEWER_RUNS_ROOT ?? join(repoRoot, "runs");
 
 // ── Data helpers ────────────────────────────────────────────────────
 
@@ -250,6 +250,15 @@ function loadSession(id: string): object[] {
 	return [];
 }
 
+// ── Static file serving ─────────────────────────────────────────────
+
+const viewerDir = join(import.meta.dirname, "../viewer");
+const STATIC_FILES: Record<string, { file: string; mime: string }> = {
+	"/": { file: "index.html", mime: "text/html; charset=utf-8" },
+	"/main.js": { file: "main.js", mime: "application/javascript; charset=utf-8" },
+	"/style.css": { file: "style.css", mime: "text/css; charset=utf-8" },
+};
+
 // ── Server ──────────────────────────────────────────────────────────
 
 function jsonResponse(res: import("node:http").ServerResponse, data: unknown): void {
@@ -287,6 +296,18 @@ const server = createServer((req, res) => {
 			wsClients: wss.clients.size,
 		});
 		return;
+	}
+
+	// Static files
+	const staticEntry = STATIC_FILES[path];
+	if (staticEntry) {
+		const filePath = join(viewerDir, staticEntry.file);
+		if (existsSync(filePath)) {
+			const content = readFileSync(filePath);
+			res.writeHead(200, { "Content-Type": staticEntry.mime });
+			res.end(content);
+			return;
+		}
 	}
 
 	res.writeHead(404, { "Content-Type": "text/plain" });
@@ -519,6 +540,44 @@ class FileWatcher {
 				}
 			}
 		}, 30_000);
+	}
+
+	/** Periodic directory rescan — catches new runs/sessions on network filesystems where fs.watch() doesn't fire */
+	startPeriodicRescan(): void {
+		setInterval(() => {
+			if (!existsSync(RUNS_ROOT)) return;
+			for (const runEntry of readdirSync(RUNS_ROOT, { withFileTypes: true })) {
+				if (!runEntry.isDirectory()) continue;
+				const sessionsDir = join(RUNS_ROOT, runEntry.name, "sessions");
+				if (!existsSync(sessionsDir)) continue;
+
+				for (const sessionEntry of readdirSync(sessionsDir, { withFileTypes: true })) {
+					if (!sessionEntry.isDirectory()) continue;
+					const sid = `${runEntry.name}/${sessionEntry.name}`;
+					if (this.activeSessions_.has(sid)) continue;
+					if (this.bufferEndTimes.has(sid)) continue; // already ended
+
+					const sessionDir = join(sessionsDir, sessionEntry.name);
+					const agent0 = join(sessionDir, "agent-0.jsonl");
+					if (!existsSync(agent0)) continue;
+
+					// Skip completed or stale sessions
+					try {
+						const raw = readFileSync(agent0, "utf-8");
+						const lines = raw.split("\n").filter((l) => l.trim());
+						if (lines.length === 0) continue;
+						const last = JSON.parse(lines[lines.length - 1]);
+						if (last.type === "session_end") continue;
+						const lastTs: number = last.ts ?? 0;
+						if ((Date.now() / 1000) - lastTs > STALE_THRESHOLD_MS / 1000) continue;
+					} catch { continue; }
+
+					this.watchSessionDir(sid, sessionDir, runEntry.name);
+					this.broadcastControl({ type: "session_active", sessionId: sid, runName: runEntry.name });
+					console.log(`[rescan] Discovered new session: ${sid}`);
+				}
+			}
+		}, 3000);
 	}
 
 	// ── Multi-agent session watching ────────────────────────────────
@@ -794,7 +853,8 @@ class FileWatcher {
 
 	watchDirectories(): void {
 		if (!existsSync(RUNS_ROOT)) {
-			mkdirSync(RUNS_ROOT, { recursive: true });
+			try { mkdirSync(RUNS_ROOT, { recursive: true }); }
+			catch { console.log(`[watch] RUNS_ROOT does not exist yet: ${RUNS_ROOT} (will use periodic rescan)`); return; }
 		}
 
 		// Watch each existing run's sessions dir
@@ -903,12 +963,13 @@ server.on("upgrade", (req, socket, head) => {
 	}
 });
 
-server.listen(port, () => {
-	console.log(`ARC Viewer API running on http://localhost:${port}`);
+server.listen(port, "0.0.0.0", () => {
+	console.log(`ARC Viewer API running on http://0.0.0.0:${port}`);
 	console.log(`  Scanning: ${RUNS_ROOT}/*/`);
 
 	fileWatcher = new FileWatcher(wss);
 	fileWatcher.scanForActiveSessions();
 	fileWatcher.watchDirectories();
+	fileWatcher.startPeriodicRescan();
 	fileWatcher.startStaleCheck();
 });
