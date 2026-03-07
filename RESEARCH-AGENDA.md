@@ -91,27 +91,6 @@ Layer 1: Search (Test-Time Evolutionary Search)
 
 Build bottom-up: SDPO training first (Pillar 1), then evaluate, then add evolution (Pillar 2). Each layer makes the layer below it better.
 
-```
-Layer 3: Meta-Search
-  Evolve the harness itself — prompts, affordances, hyperparameters
-  Fitness = Layer 1 convergence speed / solve rate across task suite
-  Runs: rarely (expensive), high leverage
-
-Layer 2: Learn (RL / Distillation)
-  Train the 8B to be a better mutator over time
-  SDFT on Opus mutation traces -> SFT on own successful mutations -> SDPO
-  Runs: periodically, between evaluation rounds
-
-Layer 1: Search (Test-Time Evolutionary Search)
-  8B model + darwinian evolver, massively parallel, per-task
-  Trade per-mutation quality for search volume (20 parents x 100 iterations)
-  Runs: at test time, per task
-```
-
-Each layer is the training signal for the layer above it. Each layer makes the layer below it cheaper or better. The stack compounds.
-
-Build and validate bottom-up. But before all three layers: establish the 8B's raw capability (Phase -1). Then Layer 1 works or it doesn't. Layer 2 is "collect winners, fine-tune, measure." Layer 3 only matters once 1 and 2 are working.
-
 
 ## Evolutionary Search Roles (from Imbue)
 

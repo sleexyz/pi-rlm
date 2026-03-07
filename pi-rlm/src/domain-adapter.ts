@@ -1,6 +1,6 @@
 /**
  * A Adapter is the complete description of a problem space.
- * The framework assembles the system prompt, wires up eval + spawnAgent + resolve/reject.
+ * The framework assembles the system prompt, wires up eval + spawnAgent + submit.
  * Everything else is domain scope.
  */
 export interface Adapter {

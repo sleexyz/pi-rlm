@@ -18,8 +18,8 @@ const MEMORY_AGENT_PREMISE =
 	"`memories.add(summary, details)`, `memories.evict(i)`, `memories.summaries()`. " +
 	"Answer the user's query by examining the memories. " +
 	"If you cannot answer the query from the available memories, " +
-	"call `resolve(new MemoryQueryError('reason'))`. " +
-	"Otherwise, call `resolve(answer)` with the answer matching the requested return type.";
+	"call `submit(new MemoryQueryError('reason'))`. " +
+	"Otherwise, call `submit(answer)` with the answer matching the requested return type.";
 
 export interface MemoriesOptions {
 	/** Event listener for the memory query agent */

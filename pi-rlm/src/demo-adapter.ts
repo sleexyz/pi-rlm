@@ -9,7 +9,7 @@ export function createDemoAdapter(): Adapter {
 		name: "Demo",
 		premise:
 			"You are a helpful assistant with access to a code eval environment. " +
-			"Use the eval tool to compute answers. Call resolve(result) with the final answer.",
+			"Use the eval tool to compute answers. Call submit(result) with the final answer.",
 		reference: [
 			"This is a demo environment with basic utility functions.",
 			"",
@@ -19,7 +19,7 @@ export function createDemoAdapter(): Adapter {
 			"  range(n) — Return array [0, 1, ..., n-1]",
 			"  sleep(ms) — Wait for ms milliseconds",
 			"",
-			"Call resolve(value) when you have the final answer.",
+			"Call submit(value) when you have the final answer.",
 		].join("\n"),
 		scope: {
 			add: (a: number, b: number) => a + b,

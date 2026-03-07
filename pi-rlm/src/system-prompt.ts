@@ -26,7 +26,7 @@ Use \`console.log()\` to print values. Output is captured and returned to you.
 - No args: auto-configured with ${domain.name} context and reference.
 - With custom prompt: uses exactly what you pass. Include \`DOMAIN_REFERENCE\` for domain context.
 
-\`agent.call(task, objects?)\` sends a task to the agent. Returns the resolved value.
+\`agent.call(task, objects?)\` sends a task to the agent. Returns the submitted value.
 
 \`\`\`js
 // One-step (preferred for one-off tasks)
@@ -46,8 +46,7 @@ const b = await agent.call("Follow-up");
 
 Sub-agents have access to \`spawnAgent\` for further delegation.
 
-**resolve(value)** — signals completion and returns a value.
-**reject(reason)** — signals failure.
+**submit(value)** — signals completion and returns a value.
 
 ## ${domain.name} Reference
 

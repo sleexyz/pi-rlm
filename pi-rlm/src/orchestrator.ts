@@ -35,12 +35,14 @@ export interface OrchestratorOptions {
 	streamFn?: StreamFn;
 	/** Session directory for per-agent message logging. */
 	sessionDir?: SessionDir;
+	/** Custom system prompt generator (e.g. generateReplSystemPrompt for code-block models). */
+	generateSystemPrompt?: (adapter: Adapter) => string;
 }
 
 /**
  * Thin shell that wires an Adapter into an eval-loop agent.
  *
- * Takes domain.scope, adds spawnAgent + resolve/reject + DOMAIN_REFERENCE,
+ * Takes domain.scope, adds spawnAgent + submit + DOMAIN_REFERENCE,
  * assembles the system prompt from domain fields, and runs the agent loop.
  */
 export class Orchestrator {
@@ -49,8 +51,6 @@ export class Orchestrator {
 	private adapter: Adapter;
 	private resolved = false;
 	private resolvedValue: unknown = undefined;
-	private rejected = false;
-	private rejectionReason: string | undefined = undefined;
 	private taggedOnEvent: ReturnType<typeof createTaggedOnEvent>;
 	private usageTracker: UsageTracker;
 	private agentLogger?: AgentLogger;
@@ -64,7 +64,8 @@ export class Orchestrator {
 		const subAgentThinkingLevel = options.subAgentThinkingLevel ?? thinkingLevel;
 
 		// Assemble system prompt from domain fields
-		const systemPrompt = generateSystemPrompt(this.adapter);
+		const promptGenerator = options.generateSystemPrompt ?? generateSystemPrompt;
+		const systemPrompt = promptGenerator(this.adapter);
 
 		// Wrap onEvent with depth=0 metadata + usage tracking
 		const wrappedOnEvent = options.onEvent
@@ -123,15 +124,12 @@ export class Orchestrator {
 		const fullScope: Record<string, unknown> = {
 			...baseScope,
 			spawnAgent,
-			resolve: (value: unknown) => {
-				if (this.resolved || this.rejected) return;
+			submit: (value: unknown) => {
+				if (this.resolved) return;
 				this.resolved = true;
 				this.resolvedValue = value;
-			},
-			reject: (reason?: string) => {
-				if (this.resolved || this.rejected) return;
-				this.rejected = true;
-				this.rejectionReason = reason ?? "Rejected without reason";
+				// Stop the agent loop — value has been submitted, no more turns needed
+				this.agent.abort();
 			},
 		};
 
@@ -149,9 +147,7 @@ export class Orchestrator {
 				}
 
 				if (this.resolved) {
-					parts.push("Resolved. Do not make further eval calls.");
-				} else if (this.rejected) {
-					parts.push(`Rejected: ${this.rejectionReason}. Do not make further eval calls.`);
+					parts.push("Submitted. Do not make further eval calls.");
 				}
 
 				return parts.length > 0 ? parts.join("\n") : undefined;
@@ -192,7 +188,7 @@ export class Orchestrator {
 	 *
 	 * @param task - The task description
 	 * @param initialObjects - Optional objects to inject into scope before running
-	 * @returns The resolved value, or undefined if rejected/not resolved
+	 * @returns The submitted value, or undefined if not submitted
 	 */
 	async run(task: string, initialObjects?: Record<string, unknown>): Promise<unknown> {
 		if (initialObjects) {
@@ -201,8 +197,6 @@ export class Orchestrator {
 
 		this.resolved = false;
 		this.resolvedValue = undefined;
-		this.rejected = false;
-		this.rejectionReason = undefined;
 
 		let message = task;
 		if (initialObjects) {
@@ -218,10 +212,6 @@ export class Orchestrator {
 		// Snapshot new messages for logging
 		if (this.agentLogger) {
 			this.agentLogger.snapshotMessages(this.agent.state.messages);
-		}
-
-		if (this.rejected) {
-			throw new Error(`Agent rejected: ${this.rejectionReason}`);
 		}
 
 		return this.resolvedValue;
@@ -253,7 +243,7 @@ export class Orchestrator {
 	 *
 	 * @param agentLogPath - Path to agent-0.jsonl from the aborted session
 	 * @param initialObjects - Optional objects to inject into scope
-	 * @returns The resolved value, or undefined if rejected/not resolved
+	 * @returns The submitted value, or undefined if not submitted
 	 */
 	async resume(agentLogPath: string, initialObjects?: Record<string, unknown>): Promise<unknown> {
 		const messages = AgentLogger.loadMessages(agentLogPath);
@@ -264,8 +254,6 @@ export class Orchestrator {
 
 		this.resolved = false;
 		this.resolvedValue = undefined;
-		this.rejected = false;
-		this.rejectionReason = undefined;
 
 		// Restore prior conversation state
 		this.agent.replaceMessages(messages);
@@ -284,10 +272,6 @@ export class Orchestrator {
 		// Snapshot new messages for logging
 		if (this.agentLogger) {
 			this.agentLogger.snapshotMessages(this.agent.state.messages);
-		}
-
-		if (this.rejected) {
-			throw new Error(`Agent rejected: ${this.rejectionReason}`);
 		}
 
 		return this.resolvedValue;

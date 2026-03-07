@@ -135,7 +135,7 @@ describe("transformMessagesForRepl", () => {
 		expect(result[2].role).toBe("user");
 		const content = (result[2] as UserMessage).content as string;
 		expect(content).toContain("Code executed:");
-		expect(content).toContain("```js\n1 + 1\n```");
+		expect(content).toContain("```javascript\n1 + 1\n```");
 		expect(content).toContain("REPL output:\n→ 2");
 	});
 

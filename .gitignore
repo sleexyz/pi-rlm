@@ -7,6 +7,12 @@ logs/
 *.jsonl
 results/
 docs/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+uv.lock
 
 # session artifacts
 PROMPT-*.md
@@ -18,3 +24,4 @@ bashes.log
 
 # misc
 .vite/
+.modalignore

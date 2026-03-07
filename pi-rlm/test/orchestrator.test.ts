@@ -29,8 +29,7 @@ describe("generateSystemPrompt", () => {
 		const adapter = makeToyAdapter();
 		const prompt = generateSystemPrompt(adapter);
 		expect(prompt).toContain("spawnAgent");
-		expect(prompt).toContain("resolve");
-		expect(prompt).toContain("reject");
+		expect(prompt).toContain("submit");
 		expect(prompt).toContain("eval");
 	});
 
@@ -82,19 +81,11 @@ describe("Orchestrator", () => {
 		expect(result.returnValue).toBe("function");
 	});
 
-	it("injects resolve into runtime", async () => {
+	it("injects submit into runtime", async () => {
 		const adapter = makeToyAdapter();
 		const orch = new Orchestrator({ model, adapter });
 		const rt = orch.getRuntime();
-		const result = await rt.eval("typeof resolve");
-		expect(result.returnValue).toBe("function");
-	});
-
-	it("injects reject into runtime", async () => {
-		const adapter = makeToyAdapter();
-		const orch = new Orchestrator({ model, adapter });
-		const rt = orch.getRuntime();
-		const result = await rt.eval("typeof reject");
+		const result = await rt.eval("typeof submit");
 		expect(result.returnValue).toBe("function");
 	});
 

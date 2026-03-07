@@ -46,11 +46,11 @@ export class AgentHandle {
 			systemPrompt,
 		});
 
-		// Create eval runtime with scope + resolve function
+		// Create eval runtime with scope + submit function
 		this.runtime = new EvalRuntime({
 			...scope,
-			resolve: (value: unknown) => {
-				if (this.resolved) return; // no-op after first resolve
+			submit: (value: unknown) => {
+				if (this.resolved) return; // no-op after first submit
 				this.resolved = true;
 				this.resolvedValue = value;
 			},
@@ -63,10 +63,10 @@ export class AgentHandle {
 				// Chain the user's onResult if provided
 				let status = options.evalToolOptions?.onResult?.(result);
 
-				// After resolve, signal the LLM to stop
+				// After submit, signal the LLM to stop
 				if (this.resolved) {
-					const resolveMsg = "Resolved. Do not make further eval calls.";
-					status = status ? `${status}\n${resolveMsg}` : resolveMsg;
+					const submitMsg = "Submitted. Do not make further eval calls.";
+					status = status ? `${status}\n${submitMsg}` : submitMsg;
 				}
 
 				return status;
@@ -210,7 +210,7 @@ export function createSpawnAgent(
 			}
 		} else {
 			effectivePrompt =
-				"You are a helpful sub-agent. Use the eval tool to execute code and accomplish your task. Call resolve(value) when done.";
+				"You are a helpful sub-agent. Use the eval tool to execute code and accomplish your task. Call submit(value) when done.";
 		}
 
 		// Create child spawnAgent with incremented depth (same counter object shared)

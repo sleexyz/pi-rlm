@@ -16,9 +16,9 @@ describe("AgentHandle", () => {
 		expect(handle.agent.state.tools[0].name).toBe("eval");
 	});
 
-	it("injects resolve into eval scope", async () => {
+	it("injects submit into eval scope", async () => {
 		const handle = new AgentHandle(model, "off", "test prompt", {});
-		const result = await handle.runtime.eval("typeof resolve");
+		const result = await handle.runtime.eval("typeof submit");
 		expect(result.returnValue).toBe("function");
 	});
 
