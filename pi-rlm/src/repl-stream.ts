@@ -45,10 +45,17 @@ interface CodeSegment {
 }
 type Segment = TextSegment | CodeSegment;
 
+/** Extract <think>...</think> block from text (Qwen3 thinking mode). Returns [thinking, remainingText]. */
+export function extractThinking(text: string): [string | null, string] {
+	const match = text.match(/^<think>([\s\S]*?)<\/think>\s*/);
+	if (!match) return [null, text];
+	return [match[1].trim(), text.slice(match[0].length)];
+}
+
 /** Parse text into segments: alternating prose and ```js/```repl code blocks. */
 export function parseReplBlocks(text: string): Segment[] {
 	const segments: Segment[] = [];
-	const pattern = /```(?:repl|js)\s*\n(.*?)\n```/gs;
+	const pattern = /```(?:repl|js|javascript)\s*\n(.*?)\n```/gs;
 	let lastIndex = 0;
 
 	for (const match of text.matchAll(pattern)) {
@@ -111,7 +118,7 @@ function toolResultToUserMessage(
 	return {
 		role: "user",
 		content:
-			`Code executed:\n\`\`\`js\n${code}\n\`\`\`\n\nREPL output:\n${output || "(no output)"}`,
+			`Code executed:\n\`\`\`javascript\n${code}\n\`\`\`\n\nREPL output:\n${output || "(no output)"}`,
 		timestamp: result.timestamp,
 	};
 }
@@ -173,6 +180,8 @@ function genToolCallId(): string {
 export interface CodeBlockStreamOptions {
 	/** Number of top logprobs per token to request (0 = disabled). Only works with vLLM. */
 	topLogprobs?: number;
+	/** Max code blocks to execute per turn. Extra blocks are skipped with a warning. (0 = unlimited) */
+	maxCodeBlocks?: number;
 }
 
 /**
@@ -274,6 +283,7 @@ async function fetchWithLogprobs(
  */
 export function createCodeBlockStreamFn(opts?: CodeBlockStreamOptions): StreamFn {
 	const topLogprobs = opts?.topLogprobs ?? 0;
+	const maxCodeBlocks = opts?.maxCodeBlocks ?? 0; // 0 = unlimited
 
 	return (model: Model<any>, context: Context, options?: SimpleStreamOptions) => {
 		// Transform context: strip tools + convert history to code-block text format
@@ -321,8 +331,12 @@ export function createCodeBlockStreamFn(opts?: CodeBlockStreamOptions): StreamFn
 					usage = finalMessage.usage;
 				}
 
+				// Strip <think> blocks so they don't waste context in history
+				// (transformMessagesForRepl skips thinking blocks)
+				const [thinking, cleanText] = extractThinking(fullText);
+
 				// Parse text into segments
-				const segments = parseReplBlocks(fullText);
+				const segments = parseReplBlocks(cleanText);
 
 				// Build output message with proper content blocks
 				const outMessage: AssistantMessage = {
@@ -344,6 +358,18 @@ export function createCodeBlockStreamFn(opts?: CodeBlockStreamOptions): StreamFn
 				output.push({ type: "start", partial: outMessage });
 
 				let contentIndex = 0;
+
+				// Emit thinking block first (excluded from history by transformMessagesForRepl)
+				if (thinking) {
+					const thinkingContent = { type: "thinking" as const, thinking };
+					outMessage.content.push(thinkingContent);
+					output.push({ type: "thinking_start", contentIndex, partial: outMessage });
+					output.push({ type: "thinking_delta", contentIndex, delta: thinking, partial: outMessage });
+					output.push({ type: "thinking_end", contentIndex, content: thinking, partial: outMessage });
+					contentIndex++;
+				}
+
+				let codeBlockCount = 0;
 				for (const segment of segments) {
 					if (segment.type === "text") {
 						const textContent = { type: "text" as const, text: segment.text };
@@ -353,6 +379,18 @@ export function createCodeBlockStreamFn(opts?: CodeBlockStreamOptions): StreamFn
 						output.push({ type: "text_end", contentIndex, content: segment.text, partial: outMessage });
 						contentIndex++;
 					} else {
+						codeBlockCount++;
+						if (maxCodeBlocks > 0 && codeBlockCount > maxCodeBlocks) {
+							// Emit skipped blocks as text so the model sees them but they don't execute
+							const skippedText = `⚠️ Code block skipped (limit: ${maxCodeBlocks} per turn). Write ONE code block per response, then wait for the result.`;
+							const textContent = { type: "text" as const, text: skippedText };
+							outMessage.content.push(textContent);
+							output.push({ type: "text_start", contentIndex, partial: outMessage });
+							output.push({ type: "text_delta", contentIndex, delta: skippedText, partial: outMessage });
+							output.push({ type: "text_end", contentIndex, content: skippedText, partial: outMessage });
+							contentIndex++;
+							continue;
+						}
 						const toolCall: ToolCall = {
 							type: "toolCall",
 							id: genToolCallId(),
@@ -412,9 +450,9 @@ export function generateCodeBlockSystemPrompt(domain: Adapter): string {
 
 ## Code Execution Environment
 
-You have a persistent JavaScript REPL. To execute code, wrap it in a \`\`\`js code block:
+You have a persistent JavaScript REPL. To execute code, wrap it in a \`\`\`javascript code block:
 
-\`\`\`js
+\`\`\`javascript
 console.log("hello");
 \`\`\`
 
@@ -431,7 +469,7 @@ Use \`console.log()\` to print values. Output is captured and returned to you.
 
 ### Important
 - Write ONE code block at a time, then wait for the result before continuing.
-- Do NOT put multiple \`\`\`js blocks in a single response — write one, see the result, then write the next.
+- Do NOT put multiple \`\`\`javascript blocks in a single response — write one, see the result, then write the next.
 
 ## Sub-agents
 
@@ -441,7 +479,7 @@ Use \`console.log()\` to print values. Output is captured and returned to you.
 
 \`agent.call(task, objects?)\` sends a task to the agent. Returns the submitted value.
 
-\`\`\`js
+\`\`\`javascript
 // One-step (preferred for one-off tasks)
 const result = await spawnAgent().call("Do something", { data });
 

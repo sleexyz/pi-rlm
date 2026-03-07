@@ -190,22 +190,23 @@ async function handleMessage(msg: {
 			return;
 		}
 
-		// Step 3-5: execute all code blocks sequentially, return feedback for the last
-		let lastFeedback = "";
-		for (const seg of codeSegments) {
-			const code = (seg as { type: "code"; code: string }).code;
-			const result = await runtime.eval(code, 30_000);
-			const output = formatOutput(result);
-			lastFeedback = formatFeedback(code, output);
+		// Execute only the first code block (enforce one-block-per-turn)
+		const code = (codeSegments[0] as { type: "code"; code: string }).code;
+		const result = await runtime.eval(code, 30_000);
+		const output = formatOutput(result);
+		let feedback = formatFeedback(code, output);
+
+		if (codeSegments.length > 1) {
+			feedback += `\n\n⚠️ ${codeSegments.length - 1} additional code block(s) were skipped. Write ONE code block per response, then wait for the result.`;
 		}
 
-		// Step 6: check submission
+		// Check submission
 		const done = hasSubmitted;
 		const reward = done ? computeReward() : 0.0;
 
 		respond({
 			type: "observation",
-			feedback: lastFeedback,
+			feedback,
 			reward,
 			done,
 			info: { turns, submitted: hasSubmitted },

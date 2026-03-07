@@ -72,12 +72,13 @@ const model = createVllmModel({ id: modelName, baseUrl });
 
 // ── Stream function with optional logprobs ──
 
-const baseStreamFn = createCodeBlockStreamFn({ topLogprobs });
+const baseStreamFn = createCodeBlockStreamFn({ topLogprobs, maxCodeBlocks: 1 });
 const streamFn: StreamFn = (m, ctx, opts) => {
 	return baseStreamFn(m, ctx, {
 		...opts,
 		temperature,
 		maxTokens: 8192,
+		apiKey: "dummy", // vLLM doesn't require auth; pi-ai's OpenAI provider demands a key
 		onPayload: (payload: any) => {
 			payload.top_p = topP;
 		},
@@ -113,6 +114,7 @@ for (let a = 0; a < numAttempts; a++) {
 			})
 		: undefined;
 
+	let turnCount = 0;
 	const orchestrator = new Orchestrator({
 		model,
 		adapter,
@@ -121,11 +123,25 @@ for (let a = 0; a < numAttempts; a++) {
 		streamFn,
 		sessionDir,
 		generateSystemPrompt: generateCodeBlockSystemPrompt,
+		onEvent: () => {}, // required for usage tracking to work
+	});
+
+	// Enforce maxTurns by aborting the agent loop
+	orchestrator.getAgent().subscribe((event: any) => {
+		if (event.type === "turn_end") {
+			turnCount++;
+			if (turnCount >= maxTurns) {
+				process.stderr.write(`[agent-runner] maxTurns (${maxTurns}) reached, aborting\n`);
+				orchestrator.getAgent().abort();
+			}
+		}
 	});
 
 	const t0 = Date.now();
 	let submittedValue: unknown;
 	let runError: string | undefined;
+
+	process.stderr.write(`[agent-runner] Starting orchestrator.run() for ${taskId} (attempt ${a + 1})\n`);
 
 	try {
 		const result = await Promise.race([
@@ -135,8 +151,10 @@ for (let a = 0; a < numAttempts; a++) {
 			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Timeout")), timeout)),
 		]);
 		submittedValue = result;
+		const msgCount = orchestrator.getAgent().state.messages.length;
+		process.stderr.write(`[agent-runner] orchestrator.run() returned: ${typeof result} (${result === undefined ? 'undefined' : 'value'}), messages: ${msgCount}\n`);
 	} catch (err) {
-		runError = String(err);
+		runError = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
 		process.stderr.write(`[agent-runner] Error: ${runError}\n`);
 	}
 
