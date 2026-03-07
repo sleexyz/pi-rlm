@@ -13,6 +13,9 @@
  *   --count <n>            Number of tasks to run (default: 5)
  *   --task-id <id>         Run a specific task by ID
  *   --model <model>        Model name (default: claude-opus-4-6)
+ *   --provider <name>      Provider: anthropic or vllm (default: anthropic)
+ *   --base-url <url>       Base URL for vLLM endpoint (e.g. http://localhost:8000/v1)
+ *   --format <fmt>         Format: tool or block (default: tool)
  *   --thinking <level>     Thinking level: off, low, medium, high, xhigh (default: high)
  *   --num-attempts <n>     Attempts per task for pass@K scoring (default: 2)
  *   --max-agents <n>       Max total agents per attempt (default: 10)
@@ -23,20 +26,25 @@
  *   --resume <run-name>    Resume an interrupted run (skips completed tasks)
  *   --stream               Stream agent output to stdout
  *   --no-log               Disable session logging (still writes run.json)
+ *   --push-modal           Push traces to Modal volume after each task (live viewer)
  */
 
 import { getModel, streamSimple } from "@mariozechner/pi-ai";
-import type { AssistantMessageEvent } from "@mariozechner/pi-ai";
+import type { AssistantMessageEvent, Model } from "@mariozechner/pi-ai";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { Orchestrator, OrchestratorTUI, createOAuthResolver, SessionDir } from "pi-rlm";
+import {
+	Orchestrator, OrchestratorTUI, createOAuthResolver, SessionDir,
+	createCodeBlockStreamFn, generateCodeBlockSystemPrompt, createVllmModel,
+} from "pi-rlm";
 import type { TaggedAgentEvent } from "pi-rlm";
 import { createArcAdapter } from "./adapter.js";
 import { loadTask, loadTasksFromDir, selectDevSet } from "./task-loader.js";
 import { accuracy } from "./grid-helpers.js";
 import { generateRunName } from "./run-names.js";
 import type { ArcGrid, ArcAttempt, ArcResult } from "./types.js";
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { execSync } from "node:child_process";
 
 // ── Stream handler ──
 
@@ -125,6 +133,9 @@ const split = getArg("--split", "training");
 const count = parseInt(getArg("--count", "5"), 10);
 const taskId = getArg("--task-id", "");
 const modelName = getArg("--model", "claude-opus-4-6");
+const provider = getArg("--provider", "anthropic") as "anthropic" | "vllm";
+const baseUrl = getArg("--base-url", "http://localhost:8000/v1");
+const format = getArg("--format", "tool") as "tool" | "block";
 const thinkingLevel = getArg("--thinking", "high") as ThinkingLevel;
 const numAttempts = parseInt(getArg("--num-attempts", "2"), 10);
 const maxAgents = parseInt(getArg("--max-agents", "10"), 10);
@@ -136,6 +147,25 @@ const resumeRunName = getArg("--resume", "");
 const allTasks = args.includes("--all");
 const stream = args.includes("--stream");
 const logEnabled = !args.includes("--no-log");
+const pushModal = args.includes("--push-modal");
+
+function modalPush(localPath: string, remotePath: string): void {
+	try {
+		execSync(`modal volume put sdpo-arc-data "${localPath}" "${remotePath}" --force`, {
+			cwd: repoRoot,
+			stdio: "pipe",
+			timeout: 30000,
+		});
+	} catch (err) {
+		console.error(`  [push-modal] Failed to push ${localPath}: ${err}`);
+	}
+}
+
+// Validate format
+if (format !== "tool" && format !== "block") {
+	console.error(`Invalid --format: ${format}. Must be 'tool' or 'block'.`);
+	process.exit(1);
+}
 
 // Resolve runs dir relative to repo root
 const resolvedRunsDir = join(repoRoot, runsDir);
@@ -149,10 +179,13 @@ interface RunJson {
 	config: {
 		split: string;
 		model: string;
+		provider: string;
+		format: string;
 		thinking: string;
 		numAttempts: number;
 		maxAgents: number;
 		taskIds: string[];
+		baseUrl?: string;
 		shard?: number;
 		numShards?: number;
 	};
@@ -173,6 +206,62 @@ function writeRunJson(path: string, data: RunJson): void {
 
 function loadRunJson(path: string): RunJson {
 	return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+/** Append a result to run.json safely for parallel shards.
+ *  Reads the current file, merges in the new result (by taskId), writes back.
+ *  Uses a .lock file with retries to avoid stomping between shards. */
+function appendResultToRunJson(path: string, result: ArcResult, runJsonTemplate: RunJson): void {
+	const lockPath = path + ".lock";
+	const maxRetries = 10;
+	const retryDelay = 200 + Math.random() * 300; // jitter
+
+	for (let attempt = 0; attempt < maxRetries; attempt++) {
+		try {
+			// Try to acquire lock (atomic: wx flag fails if file exists)
+			writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+		} catch {
+			// Lock held by another shard, wait and retry
+			Bun.sleepSync(retryDelay);
+			continue;
+		}
+
+		try {
+			// Read current state (or use template if first write)
+			let current: RunJson;
+			if (existsSync(path)) {
+				current = loadRunJson(path);
+			} else {
+				current = { ...runJsonTemplate, results: [] };
+			}
+
+			// Merge: replace if taskId exists, otherwise append
+			const idx = current.results.findIndex(r => r.taskId === result.taskId);
+			if (idx >= 0) {
+				current.results[idx] = result;
+			} else {
+				current.results.push(result);
+			}
+
+			writeRunJson(path, current);
+			return;
+		} finally {
+			// Release lock
+			try { unlinkSync(lockPath); } catch {}
+		}
+	}
+
+	// Fallback: write without lock (better than losing data)
+	console.error(`  [warn] Could not acquire lock for ${path}, writing without lock`);
+	if (existsSync(path)) {
+		const current = loadRunJson(path);
+		const idx = current.results.findIndex(r => r.taskId === result.taskId);
+		if (idx >= 0) current.results[idx] = result;
+		else current.results.push(result);
+		writeRunJson(path, current);
+	} else {
+		writeRunJson(path, { ...runJsonTemplate, results: [result] });
+	}
 }
 
 // ── Resume mode ──
@@ -222,6 +311,27 @@ if (shard >= 0 && numShards > 1) {
 	tasks = tasks.filter((_, i) => i % numShards === shard);
 }
 
+// ── Set up model ──
+
+let model: Model<any>;
+let getApiKey: ReturnType<typeof createOAuthResolver> | undefined;
+
+if (provider === "vllm") {
+	model = createVllmModel({ id: modelName, baseUrl });
+} else {
+	model = getModel("anthropic", modelName as any);
+	getApiKey = process.env.ANTHROPIC_API_KEY ? undefined : createOAuthResolver();
+}
+
+// ── Set up stream function and system prompt ──
+
+const baseStreamFn: typeof streamSimple = (m, ctx, opts) => {
+	return streamSimple(m, ctx, { ...opts, maxTokens: 128000 });
+};
+
+const streamFn = format === "block" ? createCodeBlockStreamFn() : baseStreamFn;
+const systemPromptGenerator = format === "block" ? generateCodeBlockSystemPrompt : undefined;
+
 // ── Set up run directory ──
 
 const effectiveRunName = resumeRunName || runName || generateRunName();
@@ -241,10 +351,13 @@ const runJson: RunJson = resumedRun
 			config: {
 				split,
 				model: modelName,
+				provider,
+				format,
 				thinking: thinkingLevel,
 				numAttempts,
 				maxAgents,
 				taskIds: tasks.map(t => t.id),
+				...(provider === "vllm" ? { baseUrl } : {}),
 				...(shard >= 0 ? { shard, numShards } : {}),
 			},
 			results: [],
@@ -256,7 +369,8 @@ console.log(`ARC-AGI-2 Evaluation — ${effectiveRunName}`);
 console.log(`  Run dir: ${runDir}`);
 console.log(`  Split: ${resumedRun ? resumedRun.config.split : split}`);
 console.log(`  Tasks: ${tasks.length}${shard >= 0 ? ` (shard ${shard}/${numShards})` : ""}${completedTaskIds ? ` (${completedTaskIds.size} completed, ${tasks.length - completedTaskIds.size} remaining)` : ""}`);
-console.log(`  Model: ${modelName}`);
+console.log(`  Model: ${modelName}${provider === "vllm" ? ` (vllm @ ${baseUrl})` : ""}`);
+console.log(`  Format: ${format}`);
 console.log(`  Thinking: ${thinkingLevel}`);
 console.log(`  Attempts: ${numAttempts} (pass@${numAttempts})`);
 console.log(`  Max agents: ${maxAgents}`);
@@ -264,15 +378,6 @@ console.log(`  Task IDs: ${tasks.map((t) => t.id).join(", ")}`);
 console.log();
 
 // ── Run tasks ──
-
-const model = getModel("anthropic", modelName as any);
-const getApiKey = process.env.ANTHROPIC_API_KEY ? undefined : createOAuthResolver();
-
-// Override max_tokens to 128k (default caps at 32k, which exhausts budget
-// before the model can emit tool calls when extended thinking is enabled)
-const maxTokensStreamFn: typeof streamSimple = (model, context, options) => {
-	return streamSimple(model, context, { ...options, maxTokens: 128000 });
-};
 
 for (let i = 0; i < tasks.length; i++) {
 	const { id, task } = tasks[i];
@@ -293,7 +398,7 @@ for (let i = 0; i < tasks.length; i++) {
 
 		const adapter = createArcAdapter(task);
 
-		const sessionDir = logEnabled ? new SessionDir({ logDir: sessionsDir, sessionId: `${id}_a${a}`, metadata: { taskId: id, split, model: modelName, attempt: a, run: effectiveRunName } }) : undefined;
+		const sessionDir = logEnabled ? new SessionDir({ logDir: sessionsDir, sessionId: `${id}_a${a}`, metadata: { taskId: id, split, model: modelName, provider, format, attempt: a, run: effectiveRunName } }) : undefined;
 
 		let tui: OrchestratorTUI | null = null;
 
@@ -303,8 +408,9 @@ for (let i = 0; i < tasks.length; i++) {
 			thinkingLevel,
 			maxAgents,
 			getApiKey,
-			streamFn: maxTokensStreamFn,
+			streamFn,
 			sessionDir,
+			...(systemPromptGenerator ? { generateSystemPrompt: systemPromptGenerator } : {}),
 			onEvent: (event) => {
 				if (tui) tui.handleEvent(event);
 				if (stream) handleStreamEvent(event as TaggedAgentEvent);
@@ -318,11 +424,11 @@ for (let i = 0; i < tasks.length; i++) {
 		tui.start();
 
 		const startTime = Date.now();
-		let resolvedValue: unknown;
+		let submittedValue: unknown;
 		let runError: string | undefined;
 		try {
-			resolvedValue = await orchestrator.run(
-				"Analyze the training examples, discover the transformation rule, write a `transform(grid)` function, test it on ALL training examples until accuracy=1.0, then resolve with the transform function.",
+			submittedValue = await orchestrator.run(
+				"Analyze the training examples, discover the transformation rule, write a `transform(grid)` function, test it on ALL training examples until accuracy=1.0, then submit the transform function.",
 			);
 		} catch (err) {
 			runError = String(err);
@@ -331,7 +437,7 @@ for (let i = 0; i < tasks.length; i++) {
 		const elapsed = Date.now() - startTime;
 
 		if (tui) {
-			await new Promise((resolve) => setTimeout(resolve, 100));
+			await new Promise((r) => setTimeout(r, 100));
 			tui.stop();
 		}
 
@@ -339,18 +445,18 @@ for (let i = 0; i < tasks.length; i++) {
 			orchestrator.getAgentLogger()!.close(orchestrator.getUsageTracker());
 		}
 
-		// Resolved value is the transform function. Apply it to the test input for scoring.
+		// Submitted value is the transform function. Apply it to the test input for scoring.
 		let predicted: ArcGrid | null = null;
-		if (typeof resolvedValue === "function") {
+		if (typeof submittedValue === "function") {
 			try {
-				predicted = (resolvedValue as (grid: ArcGrid) => ArcGrid)(task.test[0].input);
+				predicted = (submittedValue as (grid: ArcGrid) => ArcGrid)(task.test[0].input);
 			} catch {
 				// transform threw — treat as wrong
 			}
 		}
 		const usage = orchestrator.getUsageTracker().totalUsage();
 		const correct = predicted !== null && accuracy(predicted, expected) === 1.0;
-		const failed = runError !== undefined || resolvedValue === undefined;
+		const failed = runError !== undefined || submittedValue === undefined;
 
 		const attempt: ArcAttempt = {
 			predicted: predicted ?? [],
@@ -387,7 +493,24 @@ for (let i = 0; i < tasks.length; i++) {
 	runJson.results.push(result);
 
 	// Write run.json incrementally after each task
-	writeRunJson(runJsonPath, runJson);
+	if (shard >= 0 && numShards > 1) {
+		appendResultToRunJson(runJsonPath, result, runJson);
+	} else {
+		writeRunJson(runJsonPath, runJson);
+	}
+
+	// Push session traces + run.json to Modal volume
+	if (pushModal) {
+		const remoteRunDir = `eval-runs/${effectiveRunName}`;
+		for (let a = 0; a < attempts.length; a++) {
+			const sessionId = `${id}_a${a}`;
+			const localSessionDir = join(sessionsDir, sessionId);
+			if (existsSync(localSessionDir)) {
+				modalPush(localSessionDir, `${remoteRunDir}/sessions/${sessionId}`);
+			}
+		}
+		modalPush(runJsonPath, `${remoteRunDir}/run.json`);
+	}
 
 	const taskStatus = taskCorrect ? "CORRECT" : taskFailed ? "FAILED" : "WRONG";
 	console.log(`  pass@${numAttempts}: ${taskStatus} | cost=$${taskCost.toFixed(4)} | tokens=${taskTokens.toLocaleString()} | time=${(taskTime / 1000).toFixed(1)}s`);
@@ -410,7 +533,14 @@ runJson.summary = {
 	timeMs: totalTime,
 };
 
-writeRunJson(runJsonPath, runJson);
+// For parallel shards, re-read the merged file to get all results for the summary
+if (shard >= 0 && numShards > 1 && existsSync(runJsonPath)) {
+	const merged = loadRunJson(runJsonPath);
+	merged.summary = runJson.summary; // this shard's summary only
+	writeRunJson(runJsonPath, merged);
+} else {
+	writeRunJson(runJsonPath, runJson);
+}
 
 console.log("=".repeat(60));
 console.log(`Results Summary (pass@${numAttempts}) — ${effectiveRunName}`);
@@ -427,3 +557,8 @@ console.log(`Total cost: $${totalCost.toFixed(4)}`);
 console.log(`Total tokens: ${totalTokens.toLocaleString()}`);
 console.log(`Total time: ${(totalTime / 1000).toFixed(1)}s`);
 console.log(`\nRun saved: ${runJsonPath}`);
+
+if (pushModal) {
+	modalPush(runJsonPath, `eval-runs/${effectiveRunName}/run.json`);
+	console.log(`Pushed to Modal volume: eval-runs/${effectiveRunName}/`);
+}
