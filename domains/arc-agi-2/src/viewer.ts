@@ -178,7 +178,7 @@ function convertMessagesToEvents(sessionDir: string): object[] {
 					continue;
 				}
 
-				if (msg.role === "toolResult") {
+				if (msg.role === "toolResult" || msg.role === "tool") {
 					events.push({
 						type: "tool_execution_end",
 						agentId: agentIndex,
@@ -782,7 +782,7 @@ class FileWatcher {
 				return;
 			}
 
-			if (msg.role === "toolResult") {
+			if (msg.role === "toolResult" || msg.role === "tool") {
 				this.pushEvent(sessionId, {
 					type: "event", sessionId,
 					event: {

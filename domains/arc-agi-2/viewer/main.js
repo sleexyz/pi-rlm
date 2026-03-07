@@ -27,8 +27,9 @@ async function init() {
   const runsData = await fetch("/api/runs").then((r) => r.json());
   runs = runsData;
 
-  // Populate activeSessions from run data
+  // Populate activeSessions from run data and auto-expand all runs
   for (const run of runs) {
+    expandedRuns.add(run.name);
     if (run._activeSessions) {
       for (const sid of run._activeSessions) {
         activeSessions.add(sid);
@@ -90,12 +91,18 @@ function renderSidebar() {
     if (isExpanded) {
       html += '<div class="run-tasks">';
       const results = run.results || [];
-      const taskIds = run.config?.taskIds || [];
+      const configTaskIds = run.config?.taskIds || [];
 
       // Build result map by taskId
       const resultMap = {};
       for (const r of results) {
         resultMap[r.taskId] = r;
+      }
+
+      // Derive taskIds from config OR results (eval runs don't have config.taskIds)
+      let taskIds = configTaskIds;
+      if (taskIds.length === 0) {
+        taskIds = results.map((r) => r.taskId);
       }
 
       for (const tid of taskIds) {
@@ -117,7 +124,7 @@ function renderSidebar() {
           badge = '<span class="badge pending">\u2022\u2022\u2022</span>';
         }
 
-        const taskCost = r ? "$" + r.cost.toFixed(2) : "";
+        const taskCost = r?.cost ? "$" + r.cost.toFixed(2) : "";
         const taskTime = r ? fmtTime(r.timeMs) : "";
         const taskMeta = [taskCost, taskTime].filter(Boolean).join(" \u00b7 ");
 
@@ -154,7 +161,7 @@ function renderSidebar() {
               else if (att?.failed) attBadge = '<span class="badge fail">FAIL</span>';
               else attBadge = '<span class="badge err">\u2717</span>';
 
-              const attCost = att ? "$" + att.cost.toFixed(2) : "";
+              const attCost = att?.cost ? "$" + att.cost.toFixed(2) : "";
               const attTime = att ? fmtTime(att.timeMs) : "";
               const attMeta = [attCost, attTime].filter(Boolean).join(" \u00b7 ");
 
